@@ -15,7 +15,8 @@ from pydantic import BaseModel
 class SearchResult(BaseModel):
     title: str
     url: str
-    content: str  # snippet
+    content: str  # short snippet (always present)
+    raw_content: str | None = None  # full page text when requested
     score: float | None = None
 
 
@@ -35,8 +36,9 @@ class TavilySearchProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float = 45.0,
         search_depth: str = "advanced",
+        include_raw_content: bool = True,
     ) -> None:
         key = api_key or os.environ.get("TAVILY_API_KEY")
         if not key:
@@ -44,6 +46,7 @@ class TavilySearchProvider:
         self._api_key = key
         self._timeout_s = timeout_s
         self._search_depth = search_depth
+        self._include_raw_content = include_raw_content
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -60,6 +63,7 @@ class TavilySearchProvider:
                 "query": query,
                 "max_results": k,
                 "search_depth": self._search_depth,
+                "include_raw_content": self._include_raw_content,
             },
         )
         resp.raise_for_status()
@@ -75,6 +79,7 @@ class TavilySearchProvider:
                     title=title,
                     url=url,
                     content=r.get("content") or "",
+                    raw_content=r.get("raw_content"),
                     score=r.get("score"),
                 )
             )

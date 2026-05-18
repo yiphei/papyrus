@@ -39,7 +39,7 @@ class _LLMEvent(BaseModel):
 
     title: str
     description: str | None = None
-    category: str
+    category: EventCategory
     tags: list[str] = Field(default_factory=list)
     starts_at: datetime
     ends_at: datetime | None = None
@@ -64,11 +64,16 @@ games, theater, comedy, political rallies, town halls, protests, limited-time
 museum exhibitions, community events, parades, conferences.
 
 A single search result may describe MANY events (listing pages, monthly
-calendars, venue schedules). Emit one record for EACH concrete event you can
-identify. Do not collapse multiple events into one.
+calendars, venue schedules). EXHAUSTIVELY enumerate every concrete event you
+find. Do NOT pick favorites, summarize, or stop after a few -- emit one
+record for EACH event that satisfies the rules below.
 
 For every event you emit, ALL of the following must be true:
 - it has a SPECIFIC start date and time (not a date range alone, not "TBA")
+- the start time falls inside the requested time window (see user message).
+  If you cannot determine an exact start time inside the window, SKIP the
+  event; do NOT emit events that begin before the window starts or after it
+  ends.
 - it has a SPECIFIC venue_name (e.g. "DNA Lounge", "Oracle Park", "Civic
   Center Plaza"). SKIP the event if you cannot identify a real named venue.
 - include a street address in `address` only if explicitly stated; otherwise
@@ -114,23 +119,33 @@ def _time_window_phrase(query: EventQuery) -> str | None:
 
 
 def _build_extractor_prompt(
-    query: EventQuery, results: list[SearchResult]
+    query: EventQuery,
+    results: list[SearchResult],
+    raw_chars_per_result: int = 10000,
 ) -> str:
+    after = query.starts_after.isoformat() if query.starts_after else "any time"
+    before = query.starts_before.isoformat() if query.starts_before else "any time"
     lines = [
         f"Extract live events near {query.near or 'the queried area'}.",
-        f"Time window: {_time_window_phrase(query) or 'unspecified'}.",
-        f"Return up to {query.limit} events.",
+        f"Time window (REQUIRED): start time must be >= {after} and < {before}.",
+        f"Reject any event outside that window. Today is {datetime.now(timezone.utc).date().isoformat()}.",
+        "Enumerate exhaustively every event that satisfies the rules.",
+        "It is better to emit too many candidates than to miss any -- a",
+        "downstream filter will trim. Do not cap or summarize.",
         "",
         "Search results:",
     ]
     for i, r in enumerate(results, 1):
         lines.append(f"[{i}] {r.title}")
         lines.append(f"    URL: {r.url}")
-        if r.content:
-            snippet = r.content.strip().replace("\n", " ")
-            if len(snippet) > 600:
-                snippet = snippet[:600] + "…"
-            lines.append(f"    {snippet}")
+        body = (r.raw_content or r.content or "").strip()
+        if body:
+            body = body.replace("\r", " ")
+            if len(body) > raw_chars_per_result:
+                body = body[:raw_chars_per_result] + "…"
+            for ln in body.split("\n"):
+                if ln.strip():
+                    lines.append(f"    {ln}")
         lines.append("")
     return "\n".join(lines)
 
@@ -138,13 +153,6 @@ def _build_extractor_prompt(
 def _fingerprint(title: str, starts_at: datetime, venue: str | None) -> str:
     norm = f"{title.strip().lower()}|{starts_at.isoformat()}|{(venue or '').strip().lower()}"
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
-
-
-def _coerce_category(raw: str) -> EventCategory:
-    try:
-        return EventCategory(raw)
-    except ValueError:
-        return EventCategory.other
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -193,8 +201,8 @@ class LLMEventSource:
         self,
         client: anthropic.AsyncAnthropic | None = None,
         model: str = "claude-sonnet-4-6",
-        max_tokens: int = 4096,
-        request_timeout_s: float = 120.0,
+        max_tokens: int = 8192,
+        request_timeout_s: float = 180.0,
         search_provider: SearchProvider | None = None,
         geocoder: Geocoder | None = None,
         search_k: int = 15,
@@ -245,11 +253,12 @@ class LLMEventSource:
                 out_of_window += 1
                 continue
             events.append(ev)
+        capped = events[: query.limit]
         logger.info(
-            "extracted=%d kept=%d dropped(bbox=%d window=%d)",
-            len(parsed.events), len(events), out_of_bbox, out_of_window,
+            "extracted=%d kept=%d capped=%d dropped(bbox=%d window=%d)",
+            len(parsed.events), len(events), len(capped), out_of_bbox, out_of_window,
         )
-        return events
+        return capped
 
     async def _promote(self, item: _LLMEvent, near_hint: str | None) -> Event | None:
         coords = await self._geocode_item(item, near_hint)
@@ -264,7 +273,7 @@ class LLMEventSource:
             source_event_id=_fingerprint(item.title, starts_at, item.venue_name),
             title=item.title,
             description=item.description,
-            category=_coerce_category(item.category),
+            category=item.category,
             tags=item.tags,
             starts_at=starts_at,
             ends_at=_ensure_utc(item.ends_at) if item.ends_at else None,

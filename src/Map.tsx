@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import type { MapEvent } from 'react-map-gl/mapbox'
 import Map, { Marker, Popup } from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
 import type { EventCategory, LiveEvent } from './api'
@@ -36,13 +37,51 @@ export default function MapView() {
   const { events, loading, error } = useEvents(params)
   const [selected, setSelected] = useState<LiveEvent | null>(null)
 
+  const handleLoad = (e: MapEvent) => {
+    const map = e.target
+    map.setCamera({ 'camera-projection': 'orthographic' })
+
+    if (!map.getLayer('papyrus-3d-buildings')) {
+      const labelLayerId = map
+        .getStyle()
+        ?.layers?.find(
+          (l) => l.type === 'symbol' && (l.layout as Record<string, unknown> | undefined)?.['text-field'],
+        )?.id
+
+      map.addLayer(
+        {
+          id: 'papyrus-3d-buildings',
+          source: 'composite',
+          'source-layer': 'building',
+          filter: ['==', 'extrude', 'true'],
+          type: 'fill-extrusion',
+          minzoom: 13,
+          paint: {
+            'fill-extrusion-color': '#d8d4cc',
+            'fill-extrusion-height': ['get', 'height'],
+            'fill-extrusion-base': ['get', 'min_height'],
+            'fill-extrusion-opacity': 0.85,
+          },
+        },
+        labelLayerId,
+      )
+    }
+  }
+
   return (
     <div style={{ position: 'relative' }}>
       <Map
         mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN}
-        initialViewState={{ longitude: -122.4194, latitude: 37.7749, zoom: 12 }}
+        initialViewState={{
+          longitude: -122.4194,
+          latitude: 37.7749,
+          zoom: 15,
+          pitch: 60,
+          bearing: -30,
+        }}
         style={{ width: '100vw', height: '100vh' }}
         mapStyle="mapbox://styles/mapbox/streets-v12"
+        onLoad={handleLoad}
       >
         {events.map((ev) => (
           <Marker

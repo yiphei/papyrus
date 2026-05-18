@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "main=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && wt=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) && [ \"$main\" != \"$wt\" ] && [ ! -f .env ] && cp \"$(dirname \"$main\")/.env\" .env 2>/dev/null; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

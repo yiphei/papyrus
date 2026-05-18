@@ -10,6 +10,7 @@ deterministic API call. This trades agency for predictable latency.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import datetime, timezone
@@ -103,6 +104,25 @@ def _build_search_query(query: EventQuery) -> str:
     if when:
         parts.append(when)
     return " ".join(parts)
+
+
+# Category buckets used for multi-query fan-out when the caller did not
+# specify categories. Each bucket becomes a separate Tavily search; results
+# are round-robin merged so no single source/category dominates the prompt.
+_FANOUT_BUCKETS: tuple[tuple[EventCategory, ...], ...] = (
+    (EventCategory.concert,),
+    (
+        EventCategory.farmers_market,
+        EventCategory.festival,
+        EventCategory.fair,
+        EventCategory.community,
+    ),
+    (
+        EventCategory.theater,
+        EventCategory.exhibition,
+        EventCategory.sports,
+    ),
+)
 
 
 def _time_window_phrase(query: EventQuery) -> str | None:
@@ -206,6 +226,7 @@ class LLMEventSource:
         search_provider: SearchProvider | None = None,
         geocoder: Geocoder | None = None,
         search_k: int = 15,
+        fanout_per_bucket: int = 8,
     ) -> None:
         self._client = client or anthropic.AsyncAnthropic(timeout=request_timeout_s)
         self._model = model
@@ -213,11 +234,56 @@ class LLMEventSource:
         self._search: SearchProvider = search_provider or TavilySearchProvider()
         self._geocoder: Geocoder = geocoder or NominatimGeocoder()
         self._search_k = search_k
+        self._fanout_per_bucket = fanout_per_bucket
+
+    async def _run_searches(self, query: EventQuery) -> list[SearchResult]:
+        """Fan out to one Tavily search per category bucket and merge.
+
+        If the caller pinned `query.categories`, we honor that and do a
+        single search. Otherwise we run `_FANOUT_BUCKETS` queries in
+        parallel, round-robin merge to preserve diversity across sources,
+        dedup by URL, and cap to `self._search_k` total results so the
+        extractor prompt stays bounded.
+        """
+        if query.categories:
+            q = _build_search_query(query)
+            logger.info("tavily search: %r (k=%d)", q, self._search_k)
+            return await self._search.search(q, k=self._search_k)
+
+        sub_queries = [
+            _build_search_query(query.model_copy(update={"categories": list(cats)}))
+            for cats in _FANOUT_BUCKETS
+        ]
+        logger.info(
+            "tavily fanout: %d queries x k=%d",
+            len(sub_queries), self._fanout_per_bucket,
+        )
+        for q in sub_queries:
+            logger.info("  - %r", q)
+        result_lists = await asyncio.gather(
+            *(self._search.search(q, k=self._fanout_per_bucket) for q in sub_queries)
+        )
+
+        merged: list[SearchResult] = []
+        seen: set[str] = set()
+        max_len = max((len(rs) for rs in result_lists), default=0)
+        for i in range(max_len):
+            for rs in result_lists:
+                if i >= len(rs):
+                    continue
+                r = rs[i]
+                if r.url in seen:
+                    continue
+                seen.add(r.url)
+                merged.append(r)
+        logger.info(
+            "tavily fanout: total=%d unique=%d",
+            sum(len(rs) for rs in result_lists), len(merged),
+        )
+        return merged
 
     async def search(self, query: EventQuery) -> list[Event]:
-        search_query = _build_search_query(query)
-        logger.info("tavily search: %r (k=%d)", search_query, self._search_k)
-        results = await self._search.search(search_query, k=self._search_k)
+        results = await self._run_searches(query)
         if not results:
             return []
 

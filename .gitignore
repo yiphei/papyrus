@@ -13,3 +13,6 @@ profile_output/
 .claude/scheduled_tasks.lock
 build/
 Sources/copybara/LogfireToken.swift
+node_modules/
+dist/
+*.tsbuildinfo

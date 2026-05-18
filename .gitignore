@@ -4,6 +4,9 @@ __pycache__/
 .coverage
 note.ipynb
 .env
+.env.*
+!.env.example
+.venv/
 tau_benchmark/results/
 application_default_credentials.json
 .pnpm-store/

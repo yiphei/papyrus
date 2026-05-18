@@ -9,17 +9,17 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "mapbox-gl": "^3.8.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-map-gl": "^8.0.0"
+    "mapbox-gl": "3.23.1",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "react-map-gl": "8.1.1"
   },
   "devDependencies": {
-    "@types/react": "18.3.28",
-    "@types/react-dom": "18.3.7",
-    "@vitejs/plugin-react": "4.7.0",
-    "typescript": "5.9.3",
-    "vite": "5.4.21"
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
+    "typescript": "6.0.3",
+    "vite": "8.0.13"
   },
-  "packageManager": "pnpm@10.28.2"
+  "packageManager": "pnpm@11.1.2"
 }

@@ -35,8 +35,8 @@ class TavilySearchProvider:
     def __init__(
         self,
         api_key: str | None = None,
-        timeout_s: float = 15.0,
-        search_depth: str = "basic",
+        timeout_s: float = 30.0,
+        search_depth: str = "advanced",
     ) -> None:
         key = api_key or os.environ.get("TAVILY_API_KEY")
         if not key:

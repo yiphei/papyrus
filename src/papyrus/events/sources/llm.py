@@ -63,15 +63,25 @@ a permanent fixture: farmers markets, craft fairs, festivals, concerts, sports
 games, theater, comedy, political rallies, town halls, protests, limited-time
 museum exhibitions, community events, parades, conferences.
 
-For each search result that describes a specific live event with a known date,
-emit ONE event record. SKIP results that:
-- describe a venue, organization, or recurring program with no specific date
-- are listing/index pages summarising many events without enough detail
-- are clearly not events (news articles, blog posts about something else)
+A single search result may describe MANY events (listing pages, monthly
+calendars, venue schedules). Emit one record for EACH concrete event you can
+identify. Do not collapse multiple events into one.
 
-Use the search result's URL as the event url. Include venue_name and a street
-address when present. Do NOT include lat/lng -- a downstream system geocodes
-addresses for you.
+For every event you emit, ALL of the following must be true:
+- it has a SPECIFIC start date and time (not a date range alone, not "TBA")
+- it has a SPECIFIC venue_name (e.g. "DNA Lounge", "Oracle Park", "Civic
+  Center Plaza"). SKIP the event if you cannot identify a real named venue.
+- include a street address in `address` only if explicitly stated; otherwise
+  leave it null -- a downstream geocoder will resolve venue_name.
+
+SKIP entirely:
+- results that are pure index/category pages with no concrete events named
+- recurring programs with no specific date
+- generic "things to do" articles without dated event listings
+- news articles, blog posts, sitemap dumps
+
+Use the URL of the source search result as the event url. Do NOT invent URLs.
+Do NOT include lat/lng -- a downstream system geocodes for you.
 """
 
 
@@ -143,6 +153,23 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _in_bbox(lat: float, lng: float, bbox: tuple[float, float, float, float]) -> bool:
+    s, w, n, e = bbox
+    return s <= lat <= n and w <= lng <= e
+
+
+def _in_window(
+    starts_at: datetime,
+    after: datetime | None,
+    before: datetime | None,
+) -> bool:
+    if after is not None and starts_at < _ensure_utc(after):
+        return False
+    if before is not None and starts_at > _ensure_utc(before):
+        return False
+    return True
+
+
 def _extract_json_text(response: Any) -> str | None:
     for block in getattr(response, "content", []):
         text = getattr(block, "text", None)
@@ -170,7 +197,7 @@ class LLMEventSource:
         request_timeout_s: float = 120.0,
         search_provider: SearchProvider | None = None,
         geocoder: Geocoder | None = None,
-        search_k: int = 10,
+        search_k: int = 15,
     ) -> None:
         self._client = client or anthropic.AsyncAnthropic(timeout=request_timeout_s)
         self._model = model
@@ -206,11 +233,22 @@ class LLMEventSource:
         parsed = _LLMResponse.model_validate_json(raw)
 
         events: list[Event] = []
+        out_of_bbox = out_of_window = 0
         for item in parsed.events:
             ev = await self._promote(item, query.near)
             if ev is None:
                 continue
+            if not _in_bbox(ev.lat, ev.lng, query.bbox):
+                out_of_bbox += 1
+                continue
+            if not _in_window(ev.starts_at, query.starts_after, query.starts_before):
+                out_of_window += 1
+                continue
             events.append(ev)
+        logger.info(
+            "extracted=%d kept=%d dropped(bbox=%d window=%d)",
+            len(parsed.events), len(events), out_of_bbox, out_of_window,
+        )
         return events
 
     async def _promote(self, item: _LLMEvent, near_hint: str | None) -> Event | None:

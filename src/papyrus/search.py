@@ -6,7 +6,8 @@ they use. One concrete impl below: Tavily, designed for LLM/RAG use cases.
 from __future__ import annotations
 
 import os
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel
@@ -22,7 +23,12 @@ class SearchResult(BaseModel):
 
 @runtime_checkable
 class SearchProvider(Protocol):
-    async def search(self, query: str, k: int = 10) -> list[SearchResult]: ...
+    async def search(
+        self,
+        query: str,
+        k: int = 10,
+        include_domains: list[str] | None = None,
+    ) -> list[SearchResult]: ...
 
 
 class TavilySearchProvider:
@@ -54,18 +60,23 @@ class TavilySearchProvider:
             self._client = httpx.AsyncClient(timeout=self._timeout_s)
         return self._client
 
-    async def search(self, query: str, k: int = 10) -> list[SearchResult]:
+    async def search(
+        self,
+        query: str,
+        k: int = 10,
+        include_domains: list[str] | None = None,
+    ) -> list[SearchResult]:
         client = await self._get_client()
-        resp = await client.post(
-            self._ENDPOINT,
-            json={
-                "api_key": self._api_key,
-                "query": query,
-                "max_results": k,
-                "search_depth": self._search_depth,
-                "include_raw_content": self._include_raw_content,
-            },
-        )
+        payload: dict[str, Any] = {
+            "api_key": self._api_key,
+            "query": query,
+            "max_results": k,
+            "search_depth": self._search_depth,
+            "include_raw_content": self._include_raw_content,
+        }
+        if include_domains:
+            payload["include_domains"] = include_domains
+        resp = await client.post(self._ENDPOINT, json=payload)
         resp.raise_for_status()
         data = resp.json()
         out: list[SearchResult] = []

@@ -125,6 +125,30 @@ _FANOUT_BUCKETS: tuple[tuple[EventCategory, ...], ...] = (
 )
 
 
+# Site-restricted fan-out buckets. Each entry runs a generic event-finding
+# query but restricts Tavily to the listed domain(s) so we surface event
+# listings from specific platforms in parallel with the category buckets.
+_FANOUT_SITES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("eventbrite", ("eventbrite.com",)),
+    ("luma", ("lu.ma",)),
+    ("funcheap", ("funcheap.com", "sf.funcheap.com")),
+    ("partiful", ("partiful.com",)),
+    ("ticketmaster", ("ticketmaster.com",)),
+    ("dothebay", ("dothebay.com",)),
+)
+
+
+def _build_site_search_query(query: EventQuery) -> str:
+    where = query.near or "this region"
+    parts = [f"events in {where}"]
+    if query.text:
+        parts.append(query.text)
+    when = _time_window_phrase(query)
+    if when:
+        parts.append(when)
+    return " ".join(parts)
+
+
 def _time_window_phrase(query: EventQuery) -> str | None:
     if not query.starts_after and not query.starts_before:
         return "this week"
@@ -227,6 +251,7 @@ class LLMEventSource:
         geocoder: Geocoder | None = None,
         search_k: int = 15,
         fanout_per_bucket: int = 8,
+        fanout_site_k: int = 4,
     ) -> None:
         self._client = client or anthropic.AsyncAnthropic(timeout=request_timeout_s)
         self._model = model
@@ -235,33 +260,54 @@ class LLMEventSource:
         self._geocoder: Geocoder = geocoder or NominatimGeocoder()
         self._search_k = search_k
         self._fanout_per_bucket = fanout_per_bucket
+        self._fanout_site_k = fanout_site_k
 
     async def _run_searches(self, query: EventQuery) -> list[SearchResult]:
-        """Fan out to one Tavily search per category bucket and merge.
+        """Fan out to several Tavily searches and round-robin merge.
 
         If the caller pinned `query.categories`, we honor that and do a
-        single search. Otherwise we run `_FANOUT_BUCKETS` queries in
-        parallel, round-robin merge to preserve diversity across sources,
-        dedup by URL, and cap to `self._search_k` total results so the
-        extractor prompt stays bounded.
+        single search. Otherwise we dispatch in parallel:
+          - one query per `_FANOUT_BUCKETS` entry (category-shaped query)
+          - one query per `_FANOUT_SITES` entry (generic query restricted
+            to that platform's domain via Tavily `include_domains`)
+        Results are round-robin merged so no single source or category
+        dominates, then deduped by URL.
         """
         if query.categories:
             q = _build_search_query(query)
             logger.info("tavily search: %r (k=%d)", q, self._search_k)
             return await self._search.search(q, k=self._search_k)
 
-        sub_queries = [
-            _build_search_query(query.model_copy(update={"categories": list(cats)}))
+        cat_queries: list[tuple[str, str, list[str] | None]] = [
+            (
+                f"cat:{'+'.join(c.value for c in cats)}",
+                _build_search_query(query.model_copy(update={"categories": list(cats)})),
+                None,
+            )
             for cats in _FANOUT_BUCKETS
         ]
+        site_query_text = _build_site_search_query(query)
+        site_queries: list[tuple[str, str, list[str] | None]] = [
+            (f"site:{name}", site_query_text, list(domains))
+            for name, domains in _FANOUT_SITES
+        ]
+        jobs = cat_queries + site_queries
         logger.info(
-            "tavily fanout: %d queries x k=%d",
-            len(sub_queries), self._fanout_per_bucket,
+            "tavily fanout: %d category x k=%d, %d site x k=%d",
+            len(cat_queries), self._fanout_per_bucket,
+            len(site_queries), self._fanout_site_k,
         )
-        for q in sub_queries:
-            logger.info("  - %r", q)
+        for label, q, domains in jobs:
+            logger.info("  - [%s] %r %s", label, q, domains or "")
         result_lists = await asyncio.gather(
-            *(self._search.search(q, k=self._fanout_per_bucket) for q in sub_queries)
+            *(
+                self._search.search(
+                    q,
+                    k=self._fanout_site_k if domains else self._fanout_per_bucket,
+                    include_domains=domains,
+                )
+                for _, q, domains in jobs
+            )
         )
 
         merged: list[SearchResult] = []
@@ -276,9 +322,13 @@ class LLMEventSource:
                     continue
                 seen.add(r.url)
                 merged.append(r)
+        per_bucket_counts = ",".join(
+            f"{label}={len(rs)}"
+            for (label, _, _), rs in zip(jobs, result_lists)
+        )
         logger.info(
-            "tavily fanout: total=%d unique=%d",
-            sum(len(rs) for rs in result_lists), len(merged),
+            "tavily fanout: per-bucket [%s] unique=%d",
+            per_bucket_counts, len(merged),
         )
         return merged
 

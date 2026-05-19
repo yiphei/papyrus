@@ -6,6 +6,7 @@ note.ipynb
 .env.*
 !.env.example
 .venv/
+.direnv/
 tau_benchmark/results/
 application_default_credentials.json
 .pnpm-store/

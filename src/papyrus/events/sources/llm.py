@@ -154,11 +154,8 @@ _FANOUT_SITES: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("eventbrite.com",),
         "concerts comedy theater tickets {near} events {date_natural}",
     ),
-    (
-        "luma",
-        ("lu.ma",),
-        "{near} events meetup {date_natural}",
-    ),
+    # luma is served by a dedicated API source (see sources/luma.py); its
+    # HTML is JS-rendered, so Tavily scrapes return only page chrome.
     (
         "funcheap",
         ("funcheap.com", "sf.funcheap.com"),

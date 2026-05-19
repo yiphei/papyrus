@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from ..events import EventCategory, EventQuery, EventService
 from ..events.cache import CachedEventSource
 from ..events.sources.llm import LLMEventSource
+from ..events.sources.luma import LumaEventSource
 
 
 def create_app(service: EventService) -> FastAPI:
@@ -89,8 +90,9 @@ def _build_default_service() -> EventService:
         model=os.environ.get("PAPYRUS_LLM_MODEL", "claude-sonnet-4-6"),
     )
     cache_ttl = float(os.environ.get("PAPYRUS_CACHE_TTL_S", "900"))
-    cached = CachedEventSource(llm, ttl_seconds=cache_ttl)
-    return EventService(sources=[cached])
+    cached_llm = CachedEventSource(llm, ttl_seconds=cache_ttl)
+    cached_luma = CachedEventSource(LumaEventSource(), ttl_seconds=cache_ttl)
+    return EventService(sources=[cached_llm, cached_luma])
 
 
 app = create_app(_build_default_service())

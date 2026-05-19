@@ -161,11 +161,8 @@ _FANOUT_SITES: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("funcheap.com", "sf.funcheap.com"),
         "events in {near} {when}",
     ),
-    (
-        "partiful",
-        ("partiful.com",),
-        "{near} party event {date_natural}",
-    ),
+    # partiful is served by a dedicated source (see sources/partiful.py)
+    # that parses the SSR-rendered __NEXT_DATA__ blob on the explore page.
     (
         "ticketmaster",
         ("ticketmaster.com",),

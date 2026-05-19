@@ -9,6 +9,7 @@ import MapGL, {
 import { useEvents } from './useEvents'
 import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
+import { rankEvents, thinByPixelSeparation } from './thinning'
 
 const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
 const EVENTS_LAYER_ID = 'events-layer'
@@ -43,7 +44,7 @@ export default function MapView() {
       near: 'San Francisco',
       startsAfter: now,
       startsBefore: in2Days,
-      limit: 15,
+      limit: 200,
     }
   }, [])
 
@@ -53,18 +54,31 @@ export default function MapView() {
   const [mapLoaded, setMapLoaded] = useState(false)
   const mapRef = useRef<MapRef>(null)
 
+  // Tracked separately from the map's own viewState so we can drive
+  // zoom-keyed rendering decisions (pin thinning, clustering) without
+  // controlling the map and triggering a re-render on every pan frame.
+  const [zoom, setZoom] = useState(12)
+
+  // Rank once per event fetch; re-thin per zoom change. The ranked order is
+  // stable across zooms so pins only ever appear (never disappear) as the
+  // user zooms in.
+  const ranked = useMemo(() => rankEvents(events), [events])
+  const pins = useMemo(() => thinByPixelSeparation(ranked, zoom), [ranked, zoom])
+
   const geojson = useMemo(
     () => ({
       type: 'FeatureCollection' as const,
-      features: events.map((ev) => ({
+      features: pins.map(({ event: ev, count }) => ({
         type: 'Feature' as const,
         geometry: { type: 'Point' as const, coordinates: [ev.lng, ev.lat] },
-        properties: { id: ev.id, iconId: iconIdFor(ev) },
+        properties: { id: ev.id, iconId: iconIdFor(ev), count },
       })),
     }),
-    [events],
+    [pins],
   )
 
+  // Register an icon per event (not per visible pin) so re-thinning at higher
+  // zoom never has to wait on a fetch — the icons are already in the sprite.
   useEffect(() => {
     if (!mapLoaded) return
     const map = mapRef.current?.getMap()
@@ -119,6 +133,7 @@ export default function MapView() {
         mapStyle="mapbox://styles/mapbox/streets-v12"
         interactiveLayerIds={[EVENTS_LAYER_ID]}
         onLoad={() => setMapLoaded(true)}
+        onMoveEnd={(e) => setZoom(e.viewState.zoom)}
         onClick={handleClick}
         onMouseEnter={() => setCursor('pointer')}
         onMouseLeave={() => setCursor('')}
@@ -141,6 +156,25 @@ export default function MapView() {
                 'icon-anchor': 'bottom',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,
+                // Count badge rendered as same-layer text. text-halo gives the
+                // blue pill effect; empty string when count == 1 suppresses it.
+                'text-field': [
+                  'case',
+                  ['>', ['get', 'count'], 1],
+                  ['to-string', ['get', 'count']],
+                  '',
+                ],
+                'text-size': 11,
+                'text-anchor': 'center',
+                'text-offset': [1.9, -3.0],
+                'text-allow-overlap': true,
+                'text-ignore-placement': true,
+                'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'],
+              }}
+              paint={{
+                'text-color': '#ffffff',
+                'text-halo-color': '#2563eb',
+                'text-halo-width': 3,
               }}
             />
           </Source>
@@ -160,7 +194,13 @@ export default function MapView() {
         )}
       </MapGL>
 
-      <StatusBadge loading={loading} error={error} count={events.length} />
+      <StatusBadge
+        loading={loading}
+        error={error}
+        count={events.length}
+        shown={pins.length}
+        zoom={zoom}
+      />
     </div>
   )
 }
@@ -197,14 +237,21 @@ function StatusBadge({
   loading,
   error,
   count,
+  shown,
+  zoom,
 }: {
   loading: boolean
   error: string | null
   count: number
+  shown?: number
+  zoom?: number
 }) {
   let text = ''
   if (loading) text = 'Loading events…'
   else if (error) text = `Error: ${error}`
+  else if (shown !== undefined && shown !== count)
+    text = `${shown} of ${count} event${count === 1 ? '' : 's'}`
   else text = `${count} event${count === 1 ? '' : 's'}`
+  if (zoom !== undefined) text += `  ·  z=${zoom.toFixed(2)}`
   return <div className="status-badge">{text}</div>
 }

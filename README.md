@@ -6,8 +6,9 @@ Nominatim; React + Mapbox frontend renders them as markers.
 
 ## Running locally
 
-Prereqs: Python 3.11+, Node 20+, [pnpm](https://pnpm.io/installation), and
-three API keys.
+Prereqs: [uv](https://docs.astral.sh/uv/getting-started/installation/),
+Node 20+, [pnpm](https://pnpm.io/installation), and three API keys. uv will
+fetch the Python interpreter on first sync.
 
 ### 1. Clone and set up env
 
@@ -26,9 +27,7 @@ Fill in `.env`:
 ### 2. Backend (Python)
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+uv sync
 ```
 
 ### 3. Frontend (React + Vite)
@@ -42,8 +41,10 @@ pnpm install
 Terminal A — backend on `:8000`:
 
 ```bash
-.venv/bin/uvicorn papyrus.api.main:app --host 127.0.0.1 --port 8000 --env-file .env --reload
+uv run uvicorn papyrus.api.main:app --host 127.0.0.1 --port 8000 --env-file .env --reload
 ```
+
+(Or `just backend`.)
 
 Terminal B — frontend on `:5173`:
 

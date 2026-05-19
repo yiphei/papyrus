@@ -15,6 +15,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 import anthropic
 from pydantic import BaseModel, Field
@@ -64,13 +65,21 @@ a permanent fixture: farmers markets, craft fairs, festivals, concerts, sports
 games, theater, comedy, political rallies, town halls, protests, limited-time
 museum exhibitions, community events, parades, conferences.
 
-A single search result may describe MANY events (listing pages, monthly
-calendars, venue schedules). EXHAUSTIVELY enumerate every concrete event you
-find. Do NOT pick favorites, summarize, or stop after a few -- emit one
-record for EACH event that satisfies the rules below.
+LISTING PAGES ARE YOUR PRIMARY SOURCE OF EVENTS. Many of the results you
+receive are listing pages, daily/weekly/monthly calendars, venue schedules,
+"what to do this weekend" articles, or platform discovery pages (Eventbrite,
+Luma, Funcheap, Partiful, Ticketmaster, DoTheBay, Songkick, etc.). These
+pages typically embed dozens of dated event entries. WORK THROUGH THE PAGE
+TOP TO BOTTOM and emit ONE RECORD FOR EACH dated entry that satisfies the
+rules. Do not pick favorites; do not summarize; do not stop after a few.
+If you only emit a handful of events from a page that clearly contains many
+dated entries, you are doing it wrong.
 
 For every event you emit, ALL of the following must be true:
-- it has a SPECIFIC start date and time (not a date range alone, not "TBA")
+- it has a SPECIFIC start date and time (not a date range alone, not "TBA").
+  If only a date is given but no time, infer a sensible default for the
+  category (concerts 19:00 or 20:00, theater 19:30, markets 09:00, sports
+  per typical league start times) and emit it.
 - the start time falls inside the requested time window (see user message).
   If you cannot determine an exact start time inside the window, SKIP the
   event; do NOT emit events that begin before the window starts or after it
@@ -81,12 +90,17 @@ For every event you emit, ALL of the following must be true:
   leave it null -- a downstream geocoder will resolve venue_name.
 
 SKIP entirely:
-- results that are pure index/category pages with no concrete events named
+- results with literally zero dated event entries (pure navigation, sitemap
+  dumps, broken pages). If the page lists ANY dated events in our window,
+  process it -- do not bail because the page also has navigation chrome,
+  ads, or out-of-window content.
 - recurring programs with no specific date
-- generic "things to do" articles without dated event listings
-- news articles, blog posts, sitemap dumps
+- news articles or blog posts that only discuss past events
 
-Use the URL of the source search result as the event url. Do NOT invent URLs.
+For the event `url`, prefer the per-event ticketing/landing URL when the
+listing-page body contains one (e.g. a Ticketmaster, Eventbrite, Luma, or
+Partiful link for that specific event). Otherwise fall back to the source
+search result URL. Do NOT invent URLs.
 Do NOT include lat/lng -- a downstream system geocodes for you.
 """
 
@@ -162,13 +176,78 @@ def _time_window_phrase(query: EventQuery) -> str | None:
     return f"before {query.starts_before.date().isoformat()}"
 
 
+def _window_date_needles(query: EventQuery) -> list[str]:
+    """Day-stamped substrings likely to appear on a page that lists events
+    inside our query window. Used to bias truncation toward the relevant
+    slice of dense listing pages."""
+    needles: list[str] = []
+    start = query.starts_after.date() if query.starts_after else None
+    end = query.starts_before.date() if query.starts_before else None
+    if start is None or end is None:
+        return needles
+    months_full = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+    months_abbr = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    d = start
+    # cap to avoid pathological ranges
+    for _ in range(31):
+        needles.append(d.isoformat())                       # 2026-05-19
+        needles.append(f"{d.month}/{d.day}/{d.year}")       # 5/19/2026
+        needles.append(f"{d.month}/{d.day}")                # 5/19
+        needles.append(f"{months_full[d.month - 1]} {d.day}")   # May 19
+        needles.append(f"{months_abbr[d.month - 1]} {d.day}")   # May 19 (abbr same)
+        if d >= end:
+            break
+        d = d.fromordinal(d.toordinal() + 1)
+    return needles
+
+
+def _truncate_with_window_bias(
+    body: str, max_chars: int, needles: list[str]
+) -> str:
+    """Truncate `body` to `max_chars`. If the body is longer and contains a
+    date needle from our window, center the kept slice around the earliest
+    needle hit so window-relevant content is preserved. Otherwise take the
+    head as before."""
+    if len(body) <= max_chars:
+        return body
+    hit = -1
+    for n in needles:
+        if not n:
+            continue
+        idx = body.find(n)
+        if idx >= 0 and (hit < 0 or idx < hit):
+            hit = idx
+    if hit < 0:
+        return body[:max_chars] + "…"
+    head = max_chars // 4
+    start = max(0, hit - head)
+    end = start + max_chars
+    if end > len(body):
+        end = len(body)
+        start = max(0, end - max_chars)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(body) else ""
+    return prefix + body[start:end] + suffix
+
+
+def _host(u: str) -> str:
+    try:
+        h = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return ""
+    return h[4:] if h.startswith("www.") else h
+
+
 def _build_extractor_prompt(
     query: EventQuery,
     results: list[SearchResult],
-    raw_chars_per_result: int = 10000,
+    raw_chars_per_result: int = 25000,
 ) -> str:
     after = query.starts_after.isoformat() if query.starts_after else "any time"
     before = query.starts_before.isoformat() if query.starts_before else "any time"
+    needles = _window_date_needles(query)
     lines = [
         f"Extract live events near {query.near or 'the queried area'}.",
         f"Time window (REQUIRED): start time must be >= {after} and < {before}.",
@@ -185,8 +264,7 @@ def _build_extractor_prompt(
         body = (r.raw_content or r.content or "").strip()
         if body:
             body = body.replace("\r", " ")
-            if len(body) > raw_chars_per_result:
-                body = body[:raw_chars_per_result] + "…"
+            body = _truncate_with_window_bias(body, raw_chars_per_result, needles)
             for ln in body.split("\n"):
                 if ln.strip():
                     lines.append(f"    {ln}")
@@ -230,6 +308,65 @@ def _extract_json_text(response: Any) -> str | None:
     return None
 
 
+def _parse_llm_response(raw: str) -> "_LLMResponse | None":
+    """Parse Claude's JSON; if the response was truncated mid-stream (e.g.
+    max_tokens hit) salvage whatever complete event records we can."""
+    try:
+        return _LLMResponse.model_validate_json(raw)
+    except Exception as e:
+        logger.warning("LLM JSON parse failed (%s); attempting salvage", e)
+    import json as _json
+    import re as _re
+    head = _re.search(r'"events"\s*:\s*\[', raw)
+    if not head:
+        return None
+    pos = head.end()
+    salvaged: list[dict[str, Any]] = []
+    while pos < len(raw):
+        # skip whitespace and commas
+        while pos < len(raw) and raw[pos] in " \t\n\r,":
+            pos += 1
+        if pos >= len(raw) or raw[pos] != "{":
+            break
+        # find matching closing brace, respecting strings
+        depth = 0
+        in_str = False
+        esc = False
+        start = pos
+        while pos < len(raw):
+            c = raw[pos]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        pos += 1
+                        break
+            pos += 1
+        else:
+            break  # ran off end mid-object
+        try:
+            salvaged.append(_json.loads(raw[start:pos]))
+        except Exception:
+            break
+    logger.warning("salvaged %d events from truncated response", len(salvaged))
+    try:
+        return _LLMResponse.model_validate({"events": salvaged})
+    except Exception as e:
+        logger.warning("salvage validation failed: %s", e)
+        return None
+
+
 class LLMEventSource:
     """Search-then-extract event source.
 
@@ -245,7 +382,7 @@ class LLMEventSource:
         self,
         client: anthropic.AsyncAnthropic | None = None,
         model: str = "claude-sonnet-4-6",
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         request_timeout_s: float = 180.0,
         search_provider: SearchProvider | None = None,
         geocoder: Geocoder | None = None,
@@ -354,22 +491,51 @@ class LLMEventSource:
         raw = _extract_json_text(response)
         if not raw:
             return []
-        parsed = _LLMResponse.model_validate_json(raw)
+        parsed = _parse_llm_response(raw)
+        if parsed is None:
+            return []
 
         events: list[Event] = []
         out_of_bbox = out_of_window = 0
+        input_urls = {r.url for r in results}
+        touched_urls: set[str] = set()
         for item in parsed.events:
+            touched_urls.add(item.url)
             ev = await self._promote(item, query.near)
             if ev is None:
                 continue
             if not _in_bbox(ev.lat, ev.lng, query.bbox):
                 out_of_bbox += 1
+                logger.info(
+                    "drop[bbox] %r @ %r (%.4f,%.4f) starts=%s",
+                    ev.title, ev.venue_name, ev.lat, ev.lng,
+                    ev.starts_at.isoformat(),
+                )
                 continue
             if not _in_window(ev.starts_at, query.starts_after, query.starts_before):
                 out_of_window += 1
+                logger.info(
+                    "drop[window] %r starts=%s window=[%s, %s)",
+                    ev.title, ev.starts_at.isoformat(),
+                    query.starts_after.isoformat() if query.starts_after else "-",
+                    query.starts_before.isoformat() if query.starts_before else "-",
+                )
                 continue
             events.append(ev)
         capped = events[: query.limit]
+        same_host = 0
+        for u in touched_urls:
+            host = _host(u)
+            if any(_host(iu) == host for iu in input_urls):
+                same_host += 1
+        logger.info(
+            "url provenance: %d extractions cite an input URL, %d cite a per-event URL "
+            "on an input host, %d cite a host not in input (%d unique input URLs)",
+            len(touched_urls & input_urls),
+            same_host - len(touched_urls & input_urls),
+            len(touched_urls) - same_host,
+            len(input_urls),
+        )
         logger.info(
             "extracted=%d kept=%d capped=%d dropped(bbox=%d window=%d)",
             len(parsed.events), len(events), len(capped), out_of_bbox, out_of_window,

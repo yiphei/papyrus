@@ -28,7 +28,7 @@ export interface LiveEvent {
   description: string | null
   category: EventCategory
   tags: string[]
-  starts_at: string // ISO 8601
+  starts_at: string | null // ISO 8601
   ends_at: string | null
   timezone: string | null
   lat: number

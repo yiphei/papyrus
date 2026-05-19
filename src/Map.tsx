@@ -41,9 +41,9 @@ export default function MapView() {
       <Map
         mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN}
         initialViewState={{
-          longitude: -122.4194,
-          latitude: 37.7749,
-          zoom: 15,
+          longitude: -122.4376,
+          latitude: 37.7577,
+          zoom: 12,
         }}
         style={{ width: '100vw', height: '100vh' }}
         mapStyle="mapbox://styles/mapbox/streets-v12"

@@ -2,7 +2,7 @@
 name = "papyrus"
 version = "0.0.1"
 description = "Live-event map"
-requires-python = ">=3.11"
+requires-python = "==3.14"
 dependencies = [
     "anthropic>=0.40",
     "pydantic>=2.6",

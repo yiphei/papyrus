@@ -19,26 +19,63 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('2D canvas context unavailable')
 
+  // Letterbox-fill with white so non-square sources keep their aspect ratio
+  // and the padded area is uniform with the source's near-white background,
+  // letting the flood-fill key it all out in one pass.
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, size, size)
+
+  const scale = Math.min(size / img.width, size / img.height)
+  const drawW = img.width * scale
+  const drawH = img.height * scale
+  const drawX = (size - drawW) / 2
+  const drawY = (size - drawH) / 2
+
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
-  ctx.drawImage(img, 0, 0, size, size)
+  ctx.drawImage(img, drawX, drawY, drawW, drawH)
 
   const data = ctx.getImageData(0, 0, size, size)
-  keyOutBackground(data)
+  keyOutBackground(data, sampleBackgroundThreshold(img))
 
   if (map.hasImage(id)) map.removeImage(id)
   map.addImage(id, data, { pixelRatio: ASSET_PIXEL_RATIO })
+}
+
+// Pick a flood-fill threshold based on the source's actual corner brightness
+// (minus a margin) so darker-than-pure-white backgrounds still get keyed out.
+function sampleBackgroundThreshold(img: HTMLImageElement): number {
+  const sampler = document.createElement('canvas')
+  sampler.width = img.width
+  sampler.height = img.height
+  const sctx = sampler.getContext('2d')
+  if (!sctx) return 235
+  sctx.drawImage(img, 0, 0)
+  const w = img.width
+  const h = img.height
+  const pts: Array<[number, number]> = [
+    [0, 0], [w - 1, 0], [0, h - 1], [w - 1, h - 1],
+    [(w >> 1), 0], [0, (h >> 1)], [w - 1, (h >> 1)], [(w >> 1), h - 1],
+  ]
+  let minChannel = 255
+  for (const [x, y] of pts) {
+    const p = sctx.getImageData(x, y, 1, 1).data
+    minChannel = Math.min(minChannel, p[0], p[1], p[2])
+  }
+  // Margin keeps the flood-fill from creeping into artwork edges.
+  return Math.max(180, minChannel - 15)
 }
 
 // Source PNG is RGB without an alpha channel: the "white" background is
 // real pixels. Flood-fill from the four corners through near-white pixels,
 // setting them to transparent, then soften the boundary so anti-aliased
 // edges don't leave a hard halo around the artwork.
-function keyOutBackground(imageData: ImageData): void {
+function keyOutBackground(imageData: ImageData, fillThreshold = 235): void {
   const { width, height, data } = imageData
-  const fillThreshold = 235
-  const softenInner = 200
-  const softenOuter = 240
+  // Soften band sits just inside the fill threshold so anti-aliased edges
+  // fade out smoothly toward the cleared background.
+  const softenInner = Math.max(0, fillThreshold - 35)
+  const softenOuter = Math.min(255, fillThreshold + 5)
 
   const visited = new Uint8Array(width * height)
   const stack: number[] = [

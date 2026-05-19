@@ -3,6 +3,7 @@ import midweekMelodiesAsset from './assets/midweek-melodies.png'
 import songsFromASinkingShipAsset from './assets/songs-from-a-sinking-ship.png'
 import ferryBuildingFarmersMarketAsset from './assets/ferry-building-farmers-market.png'
 import monetAndVeniceAsset from './assets/monet-and-venice.png'
+import vividImmerseYourSensesAsset from './assets/vivid-immerse-your-senses.png'
 import type { LiveEvent } from './api'
 
 interface StaticEventInput {
@@ -17,6 +18,7 @@ const TITLE_TO_ASSET: Record<string, string> = {
   "Songs from a Sinking Ship": songsFromASinkingShipAsset,
   "Ferry BuildingFarmers Market": ferryBuildingFarmersMarketAsset,
   "Monet and Venice": monetAndVeniceAsset,
+  "Vivid: Immerse Your Senses": vividImmerseYourSensesAsset,
 }
 
 export const STATIC_EVENTS: LiveEvent[] = (staticData as StaticEventInput[]).map(

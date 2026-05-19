@@ -9,7 +9,7 @@ import MapGL, {
 import { useEvents } from './useEvents'
 import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
-import { rankEvents, thinByPixelSeparation } from './thinning'
+import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
 
 const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
 const EVENTS_LAYER_ID = 'events-layer'
@@ -54,28 +54,79 @@ export default function MapView() {
   const [mapLoaded, setMapLoaded] = useState(false)
   const mapRef = useRef<MapRef>(null)
 
-  // Tracked separately from the map's own viewState so we can drive
-  // zoom-keyed rendering decisions (pin thinning, clustering) without
-  // controlling the map and triggering a re-render on every pan frame.
+  // Two zoom signals on purpose:
+  //   - settledZoom advances only at moveEnd and drives thinning, so the
+  //     visible pin set stays stable mid-gesture (no pop-in/out during zoom).
+  //   - zoom advances on every move frame and drives per-pin sizing, so
+  //     icons scale continuously with the gesture rather than snapping at
+  //     moveEnd. Pan frames are filtered out by React's setState bail-out
+  //     (the zoom value is identical, so no re-render).
   const [zoom, setZoom] = useState(12)
+  const [settledZoom, setSettledZoom] = useState(12)
+  // Bumped on every map move (pan, zoom, rotate) so the per-pin screen-
+  // position cap recomputes. Pan alone leaves `zoom` unchanged, but
+  // map.project(lngLat) shifts with the center, so without this signal a
+  // pin that was off-screen at zoom-time stays clamped to iconSize=0 even
+  // after it pans into view.
+  const [moveTick, setMoveTick] = useState(0)
+  // Bumped only on window/canvas resize so the viewport-derived size cap
+  // recomputes when the user resizes the window.
+  const [viewportTick, setViewportTick] = useState(0)
 
-  // Rank once per event fetch; re-thin per zoom change. The ranked order is
-  // stable across zooms so pins only ever appear (never disappear) as the
-  // user zooms in.
   const ranked = useMemo(() => rankEvents(events), [events])
-  const pins = useMemo(() => thinByPixelSeparation(ranked, zoom), [ranked, zoom])
+  const thinned = useMemo(
+    () => thinByPixelSeparation(ranked, settledZoom),
+    [ranked, settledZoom],
+  )
+  // Sizing has two clamps stacked:
+  //   1. sizeByNearestNeighbor caps each pin by half its nearest-neighbor
+  //      distance (no inter-pin collision).
+  //   2. A per-pin screen-position cap: with icon-anchor='bottom' the icon
+  //      extends upward by iconSize*110 from the pin, so available upward
+  //      space is `y` to the top of the viewport; horizontally it's
+  //      centered, so available is `2 × min(x, vw - x)`. The smaller of
+  //      the two divided by 110 is the position cap. This is what stops a
+  //      lone-visible pin at deep zoom from blowing past the viewport.
+  const pins = useMemo(() => {
+    const map = mapRef.current?.getMap()
+    if (!map) return sizeByNearestNeighbor(thinned, zoom)
+    const canvas = map.getCanvas()
+    const vw = canvas.clientWidth
+    const vh = canvas.clientHeight
+    const sized = sizeByNearestNeighbor(thinned, zoom, {
+      maxSize: Math.min(vw, vh) / 110,
+    })
+    return sized.map((pin) => {
+      const { x, y } = map.project([pin.event.lng, pin.event.lat])
+      const verticalCap = Math.max(0, y) / 110
+      const horizontalCap = (2 * Math.max(0, Math.min(x, vw - x))) / 110
+      const positionCap = Math.min(verticalCap, horizontalCap)
+      return { ...pin, iconSize: Math.min(pin.iconSize, positionCap) }
+    })
+  }, [thinned, zoom, mapLoaded, viewportTick, moveTick])
 
   const geojson = useMemo(
     () => ({
       type: 'FeatureCollection' as const,
-      features: pins.map(({ event: ev, count }) => ({
+      features: pins.map(({ event: ev, count, iconSize }) => ({
         type: 'Feature' as const,
         geometry: { type: 'Point' as const, coordinates: [ev.lng, ev.lat] },
-        properties: { id: ev.id, iconId: iconIdFor(ev), count },
+        properties: { id: ev.id, iconId: iconIdFor(ev), count, iconSize },
       })),
     }),
     [pins],
   )
+
+  useEffect(() => {
+    if (!mapLoaded) return
+    const map = mapRef.current?.getMap()
+    if (!map) return
+    const bump = () => setViewportTick((t) => t + 1)
+    map.on('resize', bump)
+    return () => {
+      map.off('resize', bump)
+    }
+  }, [mapLoaded])
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
   // zoom never has to wait on a fetch — the icons are already in the sprite.
@@ -133,7 +184,11 @@ export default function MapView() {
         mapStyle="mapbox://styles/mapbox/streets-v12"
         interactiveLayerIds={[EVENTS_LAYER_ID]}
         onLoad={() => setMapLoaded(true)}
-        onMoveEnd={(e) => setZoom(e.viewState.zoom)}
+        onMove={(e) => {
+          setZoom(e.viewState.zoom)
+          setMoveTick((t) => t + 1)
+        }}
+        onMoveEnd={(e) => setSettledZoom(e.viewState.zoom)}
         onClick={handleClick}
         onMouseEnter={() => setCursor('pointer')}
         onMouseLeave={() => setCursor('')}
@@ -145,15 +200,15 @@ export default function MapView() {
               type="symbol"
               layout={{
                 'icon-image': ['get', 'iconId'],
-                'icon-size': [
-                  'interpolate',
-                  ['exponential', 1.6],
-                  ['zoom'],
-                  10, 0.35,
-                  12, 0.7,
-                  15, 1.4,
-                  18, 3.0,
-                ],
+                // Per-pin iconSize is recomputed in source data on every
+                // move frame (see useMemo on `pins` keyed to `zoom`), so a
+                // plain data expression already animates smoothly with the
+                // gesture. A zoom expression here would actually be worse —
+                // symbol layers cache the layout-time evaluation of
+                // data-driven sizes and only update on source data change,
+                // so a ['zoom']-driven scale factor wouldn't re-evaluate
+                // per frame anyway.
+                'icon-size': ['get', 'iconSize'],
                 'icon-anchor': 'bottom',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,

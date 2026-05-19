@@ -302,11 +302,11 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.40" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "pydantic", specifier = ">=2.6" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "anthropic", specifier = "==0.102.0" },
+    { name = "fastapi", specifier = "==0.136.1" },
+    { name = "httpx", specifier = "==0.28.1" },
+    { name = "pydantic", specifier = "==2.13.4" },
+    { name = "uvicorn", extras = ["standard"], specifier = "==0.47.0" },
 ]
 
 [[package]]

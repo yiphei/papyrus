@@ -2,12 +2,16 @@ import type { Map as MapboxMap } from 'mapbox-gl'
 
 const PIXEL_RATIO = 2
 
+// Higher pixel ratio than emoji pins so the bitmap stays sharp when the
+// symbol layer upscales it at deep zoom (icon-size goes up to ~3x).
+const ASSET_PIXEL_RATIO = 6
+
 export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): Promise<void> {
   if (map.hasImage(id)) return
   const img = await loadImage(url)
 
   const cssSize = 110
-  const size = cssSize * PIXEL_RATIO
+  const size = cssSize * ASSET_PIXEL_RATIO
 
   const canvas = document.createElement('canvas')
   canvas.width = size
@@ -15,13 +19,15 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('2D canvas context unavailable')
 
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
   ctx.drawImage(img, 0, 0, size, size)
 
   const data = ctx.getImageData(0, 0, size, size)
   keyOutBackground(data)
 
   if (map.hasImage(id)) map.removeImage(id)
-  map.addImage(id, data, { pixelRatio: PIXEL_RATIO })
+  map.addImage(id, data, { pixelRatio: ASSET_PIXEL_RATIO })
 }
 
 // Source PNG is RGB without an alpha channel: the "white" background is

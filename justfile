@@ -1,5 +1,4 @@
 dev:
-    uv sync
     pnpm install
     pnpm dev
 

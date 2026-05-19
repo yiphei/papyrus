@@ -87,19 +87,22 @@ export default function MapView() {
 }
 
 function EventPopupBody({ ev }: { ev: LiveEvent }) {
-  const when = new Date(ev.starts_at).toLocaleString(undefined, {
-    weekday: 'short',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  })
+  const when = ev.starts_at
+    ? new Date(ev.starts_at).toLocaleString(undefined, {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      })
+    : null
   return (
     <div className="event-popup">
       <h3>{ev.title}</h3>
-      <p className="meta">{when}</p>
+      {when && <p className="meta">{when}</p>}
       {ev.venue_name && <p className="meta">{ev.venue_name}</p>}
       {ev.address && <p className="meta">{ev.address}</p>}
+      {ev.description && <p>{ev.description}</p>}
       {ev.url && (
         <p>
           <a href={ev.url} target="_blank" rel="noreferrer">

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { fetchEvents, type FetchEventsParams, type LiveEvent } from './api'
+import { STATIC_EVENTS } from './staticEvents'
 
 export interface UseEventsState {
   events: LiveEvent[]
@@ -7,14 +8,17 @@ export interface UseEventsState {
   error: string | null
 }
 
+const USE_STATIC = import.meta.env.VITE_USE_STATIC_EVENTS === '1'
+
 // Fetches once when the stable JSON-serialized params change.
 // Keep params object identity stable in callers (e.g. useMemo) to avoid refetches.
 export function useEvents(params: FetchEventsParams): UseEventsState {
-  const [events, setEvents] = useState<LiveEvent[]>([])
-  const [loading, setLoading] = useState(true)
+  const [events, setEvents] = useState<LiveEvent[]>(USE_STATIC ? STATIC_EVENTS : [])
+  const [loading, setLoading] = useState(!USE_STATIC)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    if (USE_STATIC) return
     const controller = new AbortController()
     setLoading(true)
     setError(null)

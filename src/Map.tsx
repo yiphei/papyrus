@@ -7,7 +7,7 @@ import MapGL, {
   type MapRef,
 } from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
-import { ensureEmojiIcon } from './iconLoader'
+import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
 
@@ -63,7 +63,7 @@ const CATEGORY_ORDER: EventCategory[] = [
 ]
 
 function iconIdFor(ev: LiveEvent): string {
-  return `event-emoji-${ev.category}`
+  return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
 export default function MapView() {
@@ -189,12 +189,27 @@ export default function MapView() {
     const map = mapRef.current?.getMap()
     if (!map || events.length === 0) return
 
+    // Two-phase load. Phase 1 (sync): register the category emoji bitmap
+    // under whichever icon id each event references. For asset-bearing
+    // events this acts as a placeholder so the symbol layer can render
+    // immediately, then ensureAssetIcon swaps in the real artwork below.
+    // If the asset load fails (commonly a 404 on remote poster URLs), the
+    // emoji placeholder stays and the pin still renders — a single bad
+    // URL no longer stalls the whole layer.
     for (const ev of events) {
       const id = iconIdFor(ev)
       if (map.hasImage(id)) continue
       ensureEmojiIcon(map, id, CATEGORY_EMOJI[ev.category])
     }
     setIconsReady(true)
+
+    for (const ev of events) {
+      if (!ev.image_url) continue
+      const id = iconIdFor(ev)
+      ensureAssetIcon(map, id, ev.image_url).catch((err) => {
+        console.warn(`asset icon load failed for ${ev.id}`, err)
+      })
+    }
   }, [mapLoaded, events])
 
   const handleClick = (e: MapMouseEvent) => {

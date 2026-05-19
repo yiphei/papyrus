@@ -6,8 +6,10 @@ const PIXEL_RATIO = 2
 // symbol layer upscales it at deep zoom (icon-size goes up to ~3x).
 const ASSET_PIXEL_RATIO = 6
 
+// Upsert: caller is expected to dedupe re-loads (a placeholder image may
+// already exist at `id`, and we want to replace it once the real artwork
+// decodes — the early-return on hasImage would short-circuit that swap).
 export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): Promise<void> {
-  if (map.hasImage(id)) return
   const img = await loadImage(url)
 
   const cssSize = 110

@@ -7,11 +7,7 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const img = await loadImage(url)
 
   const cssSize = 110
-  const cssPad = 6
-  const cssRadius = 14
   const size = cssSize * PIXEL_RATIO
-  const pad = cssPad * PIXEL_RATIO
-  const radius = cssRadius * PIXEL_RATIO
 
   const canvas = document.createElement('canvas')
   canvas.width = size
@@ -19,23 +15,68 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('2D canvas context unavailable')
 
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.28)'
-  ctx.shadowBlur = 12 * PIXEL_RATIO
-  ctx.shadowOffsetY = 4 * PIXEL_RATIO
-  roundedRectPath(ctx, pad, pad, size - 2 * pad, size - 2 * pad, radius)
-  ctx.fillStyle = '#ffffff'
-  ctx.fill()
-
-  ctx.shadowColor = 'transparent'
-  ctx.save()
-  roundedRectPath(ctx, pad, pad, size - 2 * pad, size - 2 * pad, radius)
-  ctx.clip()
-  ctx.drawImage(img, pad, pad, size - 2 * pad, size - 2 * pad)
-  ctx.restore()
+  ctx.drawImage(img, 0, 0, size, size)
 
   const data = ctx.getImageData(0, 0, size, size)
+  keyOutBackground(data)
+
   if (map.hasImage(id)) map.removeImage(id)
   map.addImage(id, data, { pixelRatio: PIXEL_RATIO })
+}
+
+// Source PNG is RGB without an alpha channel: the "white" background is
+// real pixels. Flood-fill from the four corners through near-white pixels,
+// setting them to transparent, then soften the boundary so anti-aliased
+// edges don't leave a hard halo around the artwork.
+function keyOutBackground(imageData: ImageData): void {
+  const { width, height, data } = imageData
+  const fillThreshold = 235
+  const softenInner = 200
+  const softenOuter = 240
+
+  const visited = new Uint8Array(width * height)
+  const stack: number[] = [
+    0,
+    width - 1,
+    (height - 1) * width,
+    height * width - 1,
+  ]
+
+  while (stack.length) {
+    const idx = stack.pop()!
+    if (visited[idx]) continue
+    const i = idx * 4
+    if (Math.min(data[i], data[i + 1], data[i + 2]) < fillThreshold) continue
+    visited[idx] = 1
+    data[i + 3] = 0
+
+    const x = idx % width
+    const y = (idx - x) / width
+    if (x > 0) stack.push(idx - 1)
+    if (x < width - 1) stack.push(idx + 1)
+    if (y > 0) stack.push(idx - width)
+    if (y < height - 1) stack.push(idx + width)
+  }
+
+  // Boundary softening: pixels that survived the fill but sit next to a
+  // transparent neighbor get an alpha proportional to how white they are.
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x
+      if (visited[idx]) continue
+      const hasTransparentNeighbor =
+        (x > 0 && visited[idx - 1]) ||
+        (x < width - 1 && visited[idx + 1]) ||
+        (y > 0 && visited[idx - width]) ||
+        (y < height - 1 && visited[idx + width])
+      if (!hasTransparentNeighbor) continue
+      const i = idx * 4
+      const min = Math.min(data[i], data[i + 1], data[i + 2])
+      if (min >= softenOuter) data[i + 3] = 0
+      else if (min <= softenInner) continue
+      else data[i + 3] = Math.round((255 * (softenOuter - min)) / (softenOuter - softenInner))
+    }
+  }
 }
 
 export function ensureEmojiIcon(map: MapboxMap, id: string, emoji: string): void {
@@ -81,23 +122,3 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   })
 }
 
-function roundedRectPath(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
-): void {
-  ctx.beginPath()
-  ctx.moveTo(x + r, y)
-  ctx.lineTo(x + w - r, y)
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r)
-  ctx.lineTo(x + w, y + h - r)
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
-  ctx.lineTo(x + r, y + h)
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r)
-  ctx.lineTo(x, y + r)
-  ctx.quadraticCurveTo(x, y, x + r, y)
-  ctx.closePath()
-}

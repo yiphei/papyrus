@@ -5,6 +5,8 @@ export type EventCategory =
   | 'concert'
   | 'sports'
   | 'theater'
+  | 'comedy'
+  | 'film'
   | 'farmers_market'
   | 'festival'
   | 'fair'

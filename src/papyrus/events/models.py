@@ -21,6 +21,8 @@ class EventCategory(str, Enum):
     concert = "concert"
     sports = "sports"
     theater = "theater"
+    comedy = "comedy"
+    film = "film"
     farmers_market = "farmers_market"
     festival = "festival"
     fair = "fair"

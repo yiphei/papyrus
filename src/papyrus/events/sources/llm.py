@@ -136,31 +136,72 @@ _FANOUT_BUCKETS: tuple[tuple[EventCategory, ...], ...] = (
         EventCategory.exhibition,
         EventCategory.sports,
     ),
+    (
+        EventCategory.comedy,
+        EventCategory.film,
+    ),
 )
 
 
-# Site-restricted fan-out buckets. Each entry runs a generic event-finding
-# query but restricts Tavily to the listed domain(s) so we surface event
-# listings from specific platforms in parallel with the category buckets.
-_FANOUT_SITES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("eventbrite", ("eventbrite.com",)),
-    ("luma", ("lu.ma",)),
-    ("funcheap", ("funcheap.com", "sf.funcheap.com")),
-    ("partiful", ("partiful.com",)),
-    ("ticketmaster", ("ticketmaster.com",)),
-    ("dothebay", ("dothebay.com",)),
+# Site-restricted fan-out buckets. Each entry is (label, domains, template).
+# The template is rendered against {near}, {when}, and {date_natural}.
+# Tavily ranks by keyword match against page text; natural date phrases
+# like "May 19 2026" surface date-filtered discovery pages and per-event
+# URL slugs more reliably than bracketed range phrases.
+_FANOUT_SITES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    (
+        "eventbrite",
+        ("eventbrite.com",),
+        "concerts comedy theater tickets {near} events {date_natural}",
+    ),
+    (
+        "luma",
+        ("lu.ma",),
+        "{near} events meetup {date_natural}",
+    ),
+    (
+        "funcheap",
+        ("funcheap.com", "sf.funcheap.com"),
+        "events in {near} {when}",
+    ),
+    (
+        "partiful",
+        ("partiful.com",),
+        "{near} party event {date_natural}",
+    ),
+    (
+        "ticketmaster",
+        ("ticketmaster.com",),
+        "events in {near} {when}",
+    ),
+    (
+        "dothebay",
+        ("dothebay.com",),
+        "events in {near} {when}",
+    ),
 )
 
 
-def _build_site_search_query(query: EventQuery) -> str:
+def _natural_date_phrase(query: EventQuery) -> str:
+    """Tavily-friendly date phrase like "May 19 2026". Falls back to a
+    generic time hint if no anchor date is set."""
+    anchor = query.starts_after or query.starts_before
+    if anchor is None:
+        return "this week"
+    months = ["January", "February", "March", "April", "May", "June",
+             "July", "August", "September", "October", "November", "December"]
+    d = anchor.date()
+    return f"{months[d.month - 1]} {d.day} {d.year}"
+
+
+def _build_site_search_query(query: EventQuery, template: str) -> str:
     where = query.near or "this region"
-    parts = [f"events in {where}"]
+    when = _time_window_phrase(query) or ""
+    date_natural = _natural_date_phrase(query)
+    rendered = template.format(near=where, when=when, date_natural=date_natural)
     if query.text:
-        parts.append(query.text)
-    when = _time_window_phrase(query)
-    if when:
-        parts.append(when)
-    return " ".join(parts)
+        rendered = f"{rendered} {query.text}"
+    return " ".join(rendered.split())
 
 
 def _time_window_phrase(query: EventQuery) -> str | None:
@@ -423,10 +464,13 @@ class LLMEventSource:
             )
             for cats in _FANOUT_BUCKETS
         ]
-        site_query_text = _build_site_search_query(query)
         site_queries: list[tuple[str, str, list[str] | None]] = [
-            (f"site:{name}", site_query_text, list(domains))
-            for name, domains in _FANOUT_SITES
+            (
+                f"site:{name}",
+                _build_site_search_query(query, template),
+                list(domains),
+            )
+            for name, domains, template in _FANOUT_SITES
         ]
         jobs = cat_queries + site_queries
         logger.info(

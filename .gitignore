@@ -1,6 +1,5 @@
 .python-version
 __pycache__/
-*.egg-info/
 .coverage
 note.ipynb
 .env

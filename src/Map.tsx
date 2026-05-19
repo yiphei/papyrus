@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import Map, { Marker, Popup } from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
 import type { EventCategory, LiveEvent } from './api'
+import { rankEvents, thinByPixelSeparation } from './thinning'
 
 const SF_BBOX: [number, number, number, number] = [37.70, -122.52, 37.83, -122.36]
 
@@ -37,6 +38,16 @@ export default function MapView() {
 
   const { events, loading, error } = useEvents(params)
   const [selected, setSelected] = useState<LiveEvent | null>(null)
+  // Tracked separately from the map's own viewState so we can drive
+  // zoom-keyed rendering decisions (pin thinning, clustering) without
+  // controlling the map and triggering a re-render on every pan frame.
+  const [zoom, setZoom] = useState(12)
+
+  // Rank once per event fetch; re-thin per zoom change. The ranked order is
+  // stable across zooms so pins only ever appear (never disappear) as the
+  // user zooms in.
+  const ranked = useMemo(() => rankEvents(events), [events])
+  const pins = useMemo(() => thinByPixelSeparation(ranked, zoom), [ranked, zoom])
 
   return (
     <div style={{ position: 'relative' }}>
@@ -49,8 +60,9 @@ export default function MapView() {
         }}
         style={{ width: '100vw', height: '100vh' }}
         mapStyle="mapbox://styles/mapbox/streets-v12"
+        onMoveEnd={(e) => setZoom(e.viewState.zoom)}
       >
-        {events.map((ev) => (
+        {pins.map(({ event: ev, count }) => (
           <Marker
             key={ev.id}
             longitude={ev.lng}
@@ -61,8 +73,12 @@ export default function MapView() {
               setSelected(ev)
             }}
           >
-            <div className="event-pin" title={ev.title}>
+            <div
+              className="event-pin"
+              title={count > 1 ? `${ev.title}  (+${count - 1} nearby)` : ev.title}
+            >
               <span>{CATEGORY_EMOJI[ev.category]}</span>
+              {count > 1 && <span className="event-pin-count">{count}</span>}
             </div>
           </Marker>
         ))}
@@ -81,7 +97,13 @@ export default function MapView() {
         )}
       </Map>
 
-      <StatusBadge loading={loading} error={error} count={events.length} />
+      <StatusBadge
+        loading={loading}
+        error={error}
+        count={events.length}
+        shown={pins.length}
+        zoom={zoom}
+      />
     </div>
   )
 }
@@ -118,14 +140,21 @@ function StatusBadge({
   loading,
   error,
   count,
+  shown,
+  zoom,
 }: {
   loading: boolean
   error: string | null
   count: number
+  shown?: number
+  zoom?: number
 }) {
   let text = ''
   if (loading) text = 'Loading events…'
   else if (error) text = `Error: ${error}`
+  else if (shown !== undefined && shown !== count)
+    text = `${shown} of ${count} event${count === 1 ? '' : 's'}`
   else text = `${count} event${count === 1 ? '' : 's'}`
+  if (zoom !== undefined) text += `  ·  z=${zoom.toFixed(2)}`
   return <div className="status-badge">{text}</div>
 }

@@ -1,9 +1,17 @@
-import { useMemo, useState } from 'react'
-import Map, { Marker, Popup } from 'react-map-gl/mapbox'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import MapGL, {
+  Layer,
+  Popup,
+  Source,
+  type MapMouseEvent,
+  type MapRef,
+} from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
+import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 
-const SF_BBOX: [number, number, number, number] = [37.70, -122.52, 37.83, -122.36]
+const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
+const EVENTS_LAYER_ID = 'events-layer'
 
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
   concert: '🎵',
@@ -19,6 +27,10 @@ const CATEGORY_EMOJI: Record<EventCategory, string> = {
   community: '🤝',
   ugc: '📍',
   other: '📌',
+}
+
+function iconIdFor(ev: LiveEvent): string {
+  return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
 export default function MapView() {
@@ -37,10 +49,66 @@ export default function MapView() {
 
   const { events, loading, error } = useEvents(params)
   const [selected, setSelected] = useState<LiveEvent | null>(null)
+  const [iconsReady, setIconsReady] = useState(false)
+  const [mapLoaded, setMapLoaded] = useState(false)
+  const mapRef = useRef<MapRef>(null)
+
+  const geojson = useMemo(
+    () => ({
+      type: 'FeatureCollection' as const,
+      features: events.map((ev) => ({
+        type: 'Feature' as const,
+        geometry: { type: 'Point' as const, coordinates: [ev.lng, ev.lat] },
+        properties: { id: ev.id, iconId: iconIdFor(ev) },
+      })),
+    }),
+    [events],
+  )
+
+  useEffect(() => {
+    if (!mapLoaded) return
+    const map = mapRef.current?.getMap()
+    if (!map || events.length === 0) return
+    let cancelled = false
+
+    setIconsReady(false)
+    Promise.all(
+      events.map(async (ev) => {
+        const id = iconIdFor(ev)
+        if (map.hasImage(id)) return
+        if (ev.image_url) await ensureAssetIcon(map, id, ev.image_url)
+        else ensureEmojiIcon(map, id, CATEGORY_EMOJI[ev.category])
+      }),
+    )
+      .then(() => {
+        if (!cancelled) setIconsReady(true)
+      })
+      .catch((e) => console.error('Failed to load event icons', e))
+
+    return () => {
+      cancelled = true
+    }
+  }, [mapLoaded, events])
+
+  const handleClick = (e: MapMouseEvent) => {
+    const feature = e.features?.[0]
+    if (!feature) {
+      setSelected(null)
+      return
+    }
+    const id = String(feature.properties?.id ?? '')
+    setSelected(events.find((x) => x.id === id) ?? null)
+  }
+
+  const setCursor = (val: string) => {
+    const c = mapRef.current?.getMap().getCanvas()
+    if (c) c.style.cursor = val
+  }
 
   return (
     <div style={{ position: 'relative' }}>
-      <Map
+      <MapGL
+        ref={mapRef}
         mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN}
         initialViewState={{
           longitude: -122.4376,
@@ -49,23 +117,34 @@ export default function MapView() {
         }}
         style={{ width: '100vw', height: '100vh' }}
         mapStyle="mapbox://styles/mapbox/streets-v12"
+        interactiveLayerIds={[EVENTS_LAYER_ID]}
+        onLoad={() => setMapLoaded(true)}
+        onClick={handleClick}
+        onMouseEnter={() => setCursor('pointer')}
+        onMouseLeave={() => setCursor('')}
       >
-        {events.map((ev) => (
-          <Marker
-            key={ev.id}
-            longitude={ev.lng}
-            latitude={ev.lat}
-            anchor="bottom"
-            onClick={(e) => {
-              e.originalEvent.stopPropagation()
-              setSelected(ev)
-            }}
-          >
-            <div className="event-pin" title={ev.title}>
-              <span>{CATEGORY_EMOJI[ev.category]}</span>
-            </div>
-          </Marker>
-        ))}
+        {iconsReady && (
+          <Source id="events" type="geojson" data={geojson}>
+            <Layer
+              id={EVENTS_LAYER_ID}
+              type="symbol"
+              layout={{
+                'icon-image': ['get', 'iconId'],
+                'icon-size': [
+                  'interpolate',
+                  ['linear'],
+                  ['zoom'],
+                  10, 0.6,
+                  12, 1.0,
+                  15, 1.2,
+                ],
+                'icon-anchor': 'bottom',
+                'icon-allow-overlap': true,
+                'icon-ignore-placement': true,
+              }}
+            />
+          </Source>
+        )}
 
         {selected && (
           <Popup
@@ -79,7 +158,7 @@ export default function MapView() {
             <EventPopupBody ev={selected} />
           </Popup>
         )}
-      </Map>
+      </MapGL>
 
       <StatusBadge loading={loading} error={error} count={events.length} />
     </div>

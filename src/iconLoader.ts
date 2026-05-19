@@ -1,0 +1,124 @@
+import type { Map as MapboxMap } from 'mapbox-gl'
+
+const PIXEL_RATIO = 2
+
+export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): Promise<void> {
+  if (map.hasImage(id)) return
+  const img = await loadImage(url)
+
+  const cssSize = 110
+  const size = cssSize * PIXEL_RATIO
+
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('2D canvas context unavailable')
+
+  ctx.drawImage(img, 0, 0, size, size)
+
+  const data = ctx.getImageData(0, 0, size, size)
+  keyOutBackground(data)
+
+  if (map.hasImage(id)) map.removeImage(id)
+  map.addImage(id, data, { pixelRatio: PIXEL_RATIO })
+}
+
+// Source PNG is RGB without an alpha channel: the "white" background is
+// real pixels. Flood-fill from the four corners through near-white pixels,
+// setting them to transparent, then soften the boundary so anti-aliased
+// edges don't leave a hard halo around the artwork.
+function keyOutBackground(imageData: ImageData): void {
+  const { width, height, data } = imageData
+  const fillThreshold = 235
+  const softenInner = 200
+  const softenOuter = 240
+
+  const visited = new Uint8Array(width * height)
+  const stack: number[] = [
+    0,
+    width - 1,
+    (height - 1) * width,
+    height * width - 1,
+  ]
+
+  while (stack.length) {
+    const idx = stack.pop()!
+    if (visited[idx]) continue
+    const i = idx * 4
+    if (Math.min(data[i], data[i + 1], data[i + 2]) < fillThreshold) continue
+    visited[idx] = 1
+    data[i + 3] = 0
+
+    const x = idx % width
+    const y = (idx - x) / width
+    if (x > 0) stack.push(idx - 1)
+    if (x < width - 1) stack.push(idx + 1)
+    if (y > 0) stack.push(idx - width)
+    if (y < height - 1) stack.push(idx + width)
+  }
+
+  // Boundary softening: pixels that survived the fill but sit next to a
+  // transparent neighbor get an alpha proportional to how white they are.
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x
+      if (visited[idx]) continue
+      const hasTransparentNeighbor =
+        (x > 0 && visited[idx - 1]) ||
+        (x < width - 1 && visited[idx + 1]) ||
+        (y > 0 && visited[idx - width]) ||
+        (y < height - 1 && visited[idx + width])
+      if (!hasTransparentNeighbor) continue
+      const i = idx * 4
+      const min = Math.min(data[i], data[i + 1], data[i + 2])
+      if (min >= softenOuter) data[i + 3] = 0
+      else if (min <= softenInner) continue
+      else data[i + 3] = Math.round((255 * (softenOuter - min)) / (softenOuter - softenInner))
+    }
+  }
+}
+
+export function ensureEmojiIcon(map: MapboxMap, id: string, emoji: string): void {
+  if (map.hasImage(id)) return
+
+  const cssSize = 36
+  const size = cssSize * PIXEL_RATIO
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('2D canvas context unavailable')
+
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.25)'
+  ctx.shadowBlur = 6 * PIXEL_RATIO
+  ctx.shadowOffsetY = 2 * PIXEL_RATIO
+  ctx.beginPath()
+  ctx.arc(size / 2, size / 2, size / 2 - 3 * PIXEL_RATIO, 0, Math.PI * 2)
+  ctx.fillStyle = '#ffffff'
+  ctx.fill()
+
+  ctx.shadowColor = 'transparent'
+  ctx.lineWidth = 2 * PIXEL_RATIO
+  ctx.strokeStyle = '#2563eb'
+  ctx.stroke()
+
+  ctx.font = `${20 * PIXEL_RATIO}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(emoji, size / 2, size / 2 + PIXEL_RATIO)
+
+  const data = ctx.getImageData(0, 0, size, size)
+  map.addImage(id, data, { pixelRatio: PIXEL_RATIO })
+}
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error(`Failed to load image: ${url}`))
+    img.src = url
+  })
+}
+

@@ -14,6 +14,12 @@ import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thin
 const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
 const EVENTS_LAYER_ID = 'events-layer'
 
+// Proximity-to-center magnification: a pin at the map center renders at its
+// full nearest-neighbor size; a pin at the viewport edge shrinks to this
+// fraction of it. Linear falloff between, normalized to half the smaller
+// viewport dimension.
+const PROXIMITY_MIN_FACTOR = 0.4
+
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
   concert: '🎵',
   sports: '🏟️',
@@ -137,12 +143,19 @@ export default function MapView() {
     const sized = sizeByNearestNeighbor(thinned, zoom, {
       maxSize: Math.min(vw, vh) / 110,
     })
+    const cx = vw / 2
+    const cy = vh / 2
+    const halfMin = Math.min(vw, vh) / 2
     return sized.map((pin) => {
       const { x, y } = map.project([pin.event.lng, pin.event.lat])
       const verticalCap = Math.max(0, y) / 110
       const horizontalCap = (2 * Math.max(0, Math.min(x, vw - x))) / 110
       const positionCap = Math.min(verticalCap, horizontalCap)
-      return { ...pin, iconSize: Math.min(pin.iconSize, positionCap) }
+      const distNorm =
+        halfMin > 0 ? Math.min(1, Math.hypot(x - cx, y - cy) / halfMin) : 0
+      const proximityFactor = 1 - (1 - PROXIMITY_MIN_FACTOR) * distNorm
+      const iconSize = Math.min(pin.iconSize, positionCap) * proximityFactor
+      return { ...pin, iconSize }
     })
   }, [thinned, zoom, mapLoaded, viewportTick, moveTick])
 

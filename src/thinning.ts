@@ -15,10 +15,12 @@ import type { EventCategory, LiveEvent } from './api'
 export const MIN_PIXEL_SEPARATION = 20
 
 // Salience tiers. Lower number = higher priority.
-// The user has explicitly asked that partiful/concert/comedy outrank Luma
-// tech meetups (which land as `community`).
+// concert/comedy and any partiful event surface first; tech meetups (which
+// dominate the Luma feed) are deprioritized so they only fill space left
+// by everything else. Real `community` events are rare and worth surfacing
+// at the middle tier alongside theater/film/etc.
 const HIGH_CATEGORIES: ReadonlySet<EventCategory> = new Set(['concert', 'comedy'])
-const LOW_CATEGORIES: ReadonlySet<EventCategory> = new Set(['community', 'ugc', 'other'])
+const LOW_CATEGORIES: ReadonlySet<EventCategory> = new Set(['tech', 'ugc', 'other'])
 
 function priorityTier(ev: LiveEvent): number {
   if (ev.source_id === 'partiful') return 0

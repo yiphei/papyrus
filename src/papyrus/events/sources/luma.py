@@ -30,13 +30,32 @@ logger = logging.getLogger(__name__)
 _ENDPOINT = "https://api.lu.ma/discover/get-paginated-events"
 
 # Lightweight keyword -> category map. Luma events are mostly tech meetups,
-# socials, workshops; we tag the obvious genre fits and fall back to community.
+# socials, workshops; we tag the obvious genre fits, then split out tech
+# industry events, and fall back to community for the rest.
+# Order matters: more-specific buckets are matched first.
 _CATEGORY_KEYWORDS: tuple[tuple[EventCategory, tuple[str, ...]], ...] = (
     (EventCategory.comedy, ("comedy", "stand-up", "standup", "open mic")),
     (EventCategory.film, ("screening", "film festival", "movie night", "cinema")),
     (EventCategory.concert, ("concert", "live music", "dj set", "show w/")),
     (EventCategory.exhibition, ("gallery", "exhibition", "art show", "open studios")),
     (EventCategory.festival, ("festival", "fest ")),
+    (
+        EventCategory.tech,
+        (
+            "ai ", " ai", "a.i.", "ml ", " ml", "llm", "llms", "agent", "agents",
+            "agentic", "agi", "gpt", "claude", "openai", "anthropic",
+            "hackathon", "hack night", "hack day",
+            "web3", "crypto", "blockchain", "nft", "dao", "defi",
+            "founder", "founders", "startup", "startups", "yc ", "y combinator",
+            "demo day", "saas", "b2b", "vc ", " vc",
+            "developer", "developers", " dev ", " devs ",
+            "engineering", "engineer", "engineers",
+            "coding", "code ", "programming", "vibe coding",
+            "python", "javascript", "typescript", "rust", "golang",
+            "data science", "infra", "devtools", "open source",
+            "meetup", "office hours", "techweek", "tech week",
+        ),
+    ),
 )
 
 

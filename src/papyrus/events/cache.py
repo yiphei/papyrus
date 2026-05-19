@@ -32,6 +32,10 @@ def _query_key(q: EventQuery, bbox_step: float, time_step_s: int) -> CacheKey:
         _round(e, bbox_step),
     )
     cats = tuple(sorted(c.value for c in q.categories)) if q.categories else None
+    # NOTE: q.limit deliberately excluded. The inner source returns its full
+    # in-window inventory; the orchestrator applies the caller's limit after
+    # merging. Including it here would fragment the cache so a 200-pin map
+    # request and a 500-pin probe trigger separate upstream fetches.
     return (
         rb,
         q.near,
@@ -39,7 +43,6 @@ def _query_key(q: EventQuery, bbox_step: float, time_step_s: int) -> CacheKey:
         _bucket(q.starts_before, time_step_s),
         cats,
         q.text,
-        q.limit,
     )
 
 

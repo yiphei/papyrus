@@ -16,6 +16,7 @@ from ..events.cache import CachedEventSource
 from ..events.sources.llm import LLMEventSource
 from ..events.sources.luma import LumaEventSource
 from ..events.sources.partiful import PartifulEventSource
+from ..events.sources.sports import EspnSportsSource
 
 
 def create_app(service: EventService) -> FastAPI:
@@ -94,7 +95,8 @@ def _build_default_service() -> EventService:
     cached_llm = CachedEventSource(llm, ttl_seconds=cache_ttl)
     cached_luma = CachedEventSource(LumaEventSource(), ttl_seconds=cache_ttl)
     cached_partiful = CachedEventSource(PartifulEventSource(), ttl_seconds=cache_ttl)
-    return EventService(sources=[cached_llm, cached_luma, cached_partiful])
+    cached_sports = CachedEventSource(EspnSportsSource(), ttl_seconds=cache_ttl)
+    return EventService(sources=[cached_llm, cached_luma, cached_partiful, cached_sports])
 
 
 app = create_app(_build_default_service())

@@ -37,3 +37,71 @@ html, body, #root {
   color: #222;
   z-index: 1;
 }
+
+.category-filter {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  z-index: 1;
+  max-width: calc(100vw - 320px);
+  justify-content: center;
+}
+
+.cat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: 1px solid #2563eb;
+  background: #2563eb;
+  color: #fff;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+
+.cat-chip:hover {
+  filter: brightness(1.05);
+}
+
+.cat-chip.off {
+  background: #fff;
+  color: #2563eb;
+  opacity: 0.7;
+}
+
+.cat-chip.off:hover {
+  opacity: 1;
+}
+
+.cat-chip-emoji {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.cat-chip-count {
+  font-size: 11px;
+  opacity: 0.85;
+  padding-left: 2px;
+}
+
+.cat-chip.reset {
+  background: transparent;
+  color: #555;
+  border-color: #ccc;
+}
+
+.cat-chip.reset:hover {
+  background: #f3f4f6;
+}

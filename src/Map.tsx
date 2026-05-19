@@ -26,9 +26,35 @@ const CATEGORY_EMOJI: Record<EventCategory, string> = {
   exhibition: '🖼️',
   political: '🏛️',
   community: '🤝',
+  tech: '💻',
   ugc: '📍',
   other: '📌',
 }
+
+const CATEGORY_LABEL: Record<EventCategory, string> = {
+  concert: 'Concerts',
+  sports: 'Sports',
+  theater: 'Theater',
+  comedy: 'Comedy',
+  film: 'Film',
+  farmers_market: 'Markets',
+  festival: 'Festivals',
+  fair: 'Fairs',
+  exhibition: 'Exhibitions',
+  political: 'Political',
+  community: 'Community',
+  tech: 'Tech',
+  ugc: 'User',
+  other: 'Other',
+}
+
+// Display order for the filter bar. Categories with zero events in the
+// current fetch are hidden, so this list can stay long without crowding.
+const CATEGORY_ORDER: EventCategory[] = [
+  'concert', 'sports', 'theater', 'comedy', 'film',
+  'farmers_market', 'festival', 'fair', 'exhibition',
+  'political', 'community', 'tech', 'ugc', 'other',
+]
 
 function iconIdFor(ev: LiveEvent): string {
   return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
@@ -72,8 +98,23 @@ export default function MapView() {
   // Bumped only on window/canvas resize so the viewport-derived size cap
   // recomputes when the user resizes the window.
   const [viewportTick, setViewportTick] = useState(0)
+  // null = "all on"; a Set = explicit allowlist. Filtering is client-side
+  // because the backend caches the full inventory and toggling on the
+  // server would force a refetch on every click.
+  const [activeCats, setActiveCats] = useState<Set<EventCategory> | null>(null)
 
-  const ranked = useMemo(() => rankEvents(events), [events])
+  const countsByCategory = useMemo(() => {
+    const m = new Map<EventCategory, number>()
+    for (const ev of events) m.set(ev.category, (m.get(ev.category) ?? 0) + 1)
+    return m
+  }, [events])
+
+  const visibleEvents = useMemo(() => {
+    if (activeCats === null) return events
+    return events.filter((ev) => activeCats.has(ev.category))
+  }, [events, activeCats])
+
+  const ranked = useMemo(() => rankEvents(visibleEvents), [visibleEvents])
   const thinned = useMemo(
     () => thinByPixelSeparation(ranked, settledZoom),
     [ranked, settledZoom],
@@ -170,6 +211,22 @@ export default function MapView() {
     if (c) c.style.cursor = val
   }
 
+  function toggleCategory(cat: EventCategory) {
+    setActiveCats((prev) => {
+      // First click on any chip: snapshot the current "all enabled" set
+      // and remove just the clicked one.
+      const all = new Set<EventCategory>(countsByCategory.keys())
+      const base = prev ?? all
+      const next = new Set(base)
+      if (next.has(cat)) next.delete(cat)
+      else next.add(cat)
+      // Collapse back to null when every available category is on, so the
+      // visual state matches "no filter active".
+      if (next.size === all.size) return null
+      return next
+    })
+  }
+
   return (
     <div style={{ position: 'relative' }}>
       <MapGL
@@ -257,6 +314,54 @@ export default function MapView() {
         shown={pins.length}
         zoom={zoom}
       />
+
+      <CategoryFilter
+        counts={countsByCategory}
+        active={activeCats}
+        onToggle={toggleCategory}
+        onReset={() => setActiveCats(null)}
+      />
+    </div>
+  )
+}
+
+function CategoryFilter({
+  counts,
+  active,
+  onToggle,
+  onReset,
+}: {
+  counts: Map<EventCategory, number>
+  active: Set<EventCategory> | null
+  onToggle: (cat: EventCategory) => void
+  onReset: () => void
+}) {
+  const present = CATEGORY_ORDER.filter((c) => (counts.get(c) ?? 0) > 0)
+  if (present.length === 0) return null
+  const filtering = active !== null
+  return (
+    <div className="category-filter" role="group" aria-label="Filter by category">
+      {present.map((cat) => {
+        const on = active === null || active.has(cat)
+        return (
+          <button
+            key={cat}
+            type="button"
+            className={`cat-chip${on ? '' : ' off'}`}
+            onClick={() => onToggle(cat)}
+            aria-pressed={on}
+          >
+            <span className="cat-chip-emoji">{CATEGORY_EMOJI[cat]}</span>
+            <span className="cat-chip-label">{CATEGORY_LABEL[cat]}</span>
+            <span className="cat-chip-count">{counts.get(cat)}</span>
+          </button>
+        )
+      })}
+      {filtering && (
+        <button type="button" className="cat-chip reset" onClick={onReset}>
+          Reset
+        </button>
+      )}
     </div>
   )
 }

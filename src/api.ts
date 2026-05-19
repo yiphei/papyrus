@@ -13,6 +13,7 @@ export type EventCategory =
   | 'exhibition'
   | 'political'
   | 'community'
+  | 'tech'
   | 'ugc'
   | 'other'
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
@@ -89,12 +89,36 @@ For every event you emit, ALL of the following must be true:
 - include a street address in `address` only if explicitly stated; otherwise
   leave it null -- a downstream geocoder will resolve venue_name.
 
+TWO EXPLICIT EXCEPTIONS to the "specific time" rule -- emit these even
+though they span ranges or repeat:
+
+1. EXHIBITIONS (museum / gallery shows) with a stated multi-day run.
+   If the run overlaps the requested window, emit ONE record. Use the
+   first day of overlap (window start, or the show's opening day if it
+   opens inside the window) at the venue's typical opening hour
+   (default 10:00 local). Put the full run dates in `description` if
+   stated. Set `ends_at` to the closing date end-of-day if known.
+
+2. RECURRING WEEKLY EVENTS that name an explicit weekday + time
+   (e.g. "Saturdays 9am-2pm", "every Wednesday 4-8pm"). This covers
+   farmers markets, weekly food halls, weekly community classes,
+   weekly open mics. Emit ONE record for EACH occurrence whose start
+   time lands inside the requested window. Use the stated start time
+   on the matching weekday's actual calendar date.
+
+   IF NO STATED WEEKDAY FALLS INSIDE THE REQUESTED WINDOW, SKIP THE
+   EVENT ENTIRELY. Do NOT stamp it with the window's start or end
+   date, and do NOT shift it to a different weekday. A "Saturday
+   farmers market" inside a Tuesday-Thursday window must be omitted,
+   not relabeled as Tuesday or Thursday.
+
 SKIP entirely:
 - results with literally zero dated event entries (pure navigation, sitemap
   dumps, broken pages). If the page lists ANY dated events in our window,
   process it -- do not bail because the page also has navigation chrome,
   ads, or out-of-window content.
-- recurring programs with no specific date
+- recurring programs with no explicit weekday + time pattern (see
+  exception 2 above for what IS allowed)
 - news articles or blog posts that only discuss past events
 
 For the event `url`, prefer the per-event ticketing/landing URL when the
@@ -102,6 +126,31 @@ listing-page body contains one (e.g. a Ticketmaster, Eventbrite, Luma, or
 Partiful link for that specific event). Otherwise fall back to the source
 search result URL. Do NOT invent URLs.
 Do NOT include lat/lng -- a downstream system geocodes for you.
+
+CATEGORY ASSIGNMENT. Pick the most specific category that fits. Guidance:
+- `concert`: ticketed live music, DJ sets, symphony, opera, residencies.
+- `sports`: pro/college/amateur games (MLB, NBA, NHL, MLS, NWSL, college),
+  marathons, regattas, fight nights.
+- `theater`: plays, musicals, dance performances, ballet.
+- `comedy`: stand-up, improv, comedy showcases, open mics.
+- `film`: screenings, festivals, retrospectives, indie premieres.
+- `farmers_market`: weekly farmers markets, food halls' market days.
+- `festival`: multi-day celebrations (music, food, cultural, pride).
+- `fair`: craft fairs, holiday fairs, school fairs, street fairs.
+- `exhibition`: limited-run museum or gallery shows (not the museum's
+  permanent collection).
+- `political`: rallies, protests, town halls, candidate forums, civic
+  hearings, party committee meetings.
+- `tech`: tech industry events. Hackathons, demo days, AI/ML/LLM/agents
+  meetups, web3/crypto/blockchain events, founder/startup mixers, YC and
+  VC events, developer/engineering meetups, SaaS/B2B/devtools talks,
+  programming-language groups (Python/Rust/JS/Go), data science meetups.
+  If the event is a tech meetup it is `tech`, NOT `community`.
+- `community`: civic and neighborhood gatherings unrelated to tech --
+  mutual aid, block parties, volunteer days, religious community events,
+  neighborhood association meetings, language exchanges, run/book/cycle
+  clubs, parenting groups.
+- `other`: only when nothing above fits. Avoid this when possible.
 """
 
 
@@ -109,7 +158,12 @@ def _build_search_query(query: EventQuery) -> str:
     where = query.near or "this region"
     cats: list[str] = []
     if query.categories:
-        cats = [c.value.replace("_", " ") for c in query.categories]
+        if len(query.categories) == 1:
+            cats = [_CATEGORY_QUERY_HEAD.get(
+                query.categories[0], query.categories[0].value.replace("_", " ")
+            )]
+        else:
+            cats = [c.value.replace("_", " ") for c in query.categories]
     head = " ".join(cats) if cats else "live events"
     parts = [f"{head} in {where}"]
     if query.text:
@@ -120,26 +174,45 @@ def _build_search_query(query: EventQuery) -> str:
     return " ".join(parts)
 
 
+# Search-friendly phrasings for single-category queries. Bare category names
+# like "community" or "political" produce noisy Tavily results; richer
+# multi-word heads surface the right kind of listing pages.
+_CATEGORY_QUERY_HEAD: dict[EventCategory, str] = {
+    EventCategory.concert: "concerts live music",
+    EventCategory.sports: "sports games tickets",
+    EventCategory.theater: "theater plays musicals",
+    EventCategory.comedy: "comedy stand-up shows",
+    EventCategory.film: "film screenings",
+    EventCategory.farmers_market: "farmers market",
+    EventCategory.festival: "festival",
+    EventCategory.fair: "craft fair street fair",
+    EventCategory.exhibition: "museum gallery exhibition",
+    EventCategory.political: "political rally protest town hall",
+    EventCategory.community: "community events neighborhood",
+}
+
+
 # Category buckets used for multi-query fan-out when the caller did not
 # specify categories. Each bucket becomes a separate Tavily search; results
 # are round-robin merged so no single source/category dominates the prompt.
+#
+# We deliberately give each under-served category its own bucket so a
+# narrow Tavily query like "sports games in San Francisco ..." surfaces
+# venue-specific listings instead of being diluted by a multi-category
+# bag-of-keywords. `tech` is intentionally absent: the Luma direct source
+# already supplies more than enough tech events.
 _FANOUT_BUCKETS: tuple[tuple[EventCategory, ...], ...] = (
     (EventCategory.concert,),
-    (
-        EventCategory.farmers_market,
-        EventCategory.festival,
-        EventCategory.fair,
-        EventCategory.community,
-    ),
-    (
-        EventCategory.theater,
-        EventCategory.exhibition,
-        EventCategory.sports,
-    ),
-    (
-        EventCategory.comedy,
-        EventCategory.film,
-    ),
+    (EventCategory.comedy,),
+    (EventCategory.film,),
+    (EventCategory.theater,),
+    (EventCategory.sports,),
+    (EventCategory.exhibition,),
+    (EventCategory.farmers_market,),
+    (EventCategory.festival,),
+    (EventCategory.fair,),
+    (EventCategory.political,),
+    (EventCategory.community,),
 )
 
 
@@ -159,19 +232,19 @@ _FANOUT_SITES: tuple[tuple[str, tuple[str, ...], str], ...] = (
     (
         "funcheap",
         ("funcheap.com", "sf.funcheap.com"),
-        "events in {near} {when}",
+        "farmers market fair exhibition free events {near} {when}",
     ),
     # partiful is served by a dedicated source (see sources/partiful.py)
     # that parses the SSR-rendered __NEXT_DATA__ blob on the explore page.
     (
         "ticketmaster",
         ("ticketmaster.com",),
-        "events in {near} {when}",
+        "sports theater concerts tickets {near} {date_natural}",
     ),
     (
         "dothebay",
         ("dothebay.com",),
-        "events in {near} {when}",
+        "theater exhibition rally protest farmers market {near} {date_natural}",
     ),
 )
 
@@ -335,6 +408,94 @@ def _in_window(
     return True
 
 
+_WEEKDAY_NAMES: tuple[str, ...] = (
+    "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+)
+
+
+def _stated_weekdays(item: "_LLMEvent") -> set[int]:
+    """Whole-word weekday tokens ('Saturday', 'Sundays') mentioned in the
+    title or description, as weekday indices (Mon=0..Sun=6).
+
+    Avoids regex \\b because the project sticks to portable core regex
+    elsewhere; a manual scan is fine here since the corpus is short.
+    """
+    text = f"{item.title or ''} {item.description or ''}".lower()
+    found: set[int] = set()
+    for i, name in enumerate(_WEEKDAY_NAMES):
+        n = len(name)
+        start = 0
+        while True:
+            idx = text.find(name, start)
+            if idx < 0:
+                break
+            before = text[idx - 1] if idx > 0 else " "
+            after_idx = idx + n
+            after = text[after_idx] if after_idx < len(text) else " "
+            if not before.isalpha():
+                tail_ok = not after.isalpha() or (
+                    after == "s"
+                    and (after_idx + 1 >= len(text)
+                         or not text[after_idx + 1].isalpha())
+                )
+                if tail_ok:
+                    found.add(i)
+            start = idx + 1
+    return found
+
+
+_WEEKLY_GATED_CATEGORIES: frozenset[EventCategory] = frozenset({
+    EventCategory.farmers_market,
+    EventCategory.community,
+})
+
+
+def _resolve_weekly_occurrence(
+    item: "_LLMEvent",
+    after: datetime | None,
+    before: datetime | None,
+) -> "_LLMEvent | None":
+    """Enforce the prompt's "stated weekday must land in the window" rule
+    for recurring weekly events. The LLM tends to violate it by stamping
+    every weekly occurrence with the window-start date regardless of its
+    actual day of week.
+
+    If the item's category is one we gate (farmers markets and community
+    meetups -- both dominated by weekly cadences) and the title or
+    description names explicit weekdays, validate the assigned starts_at
+    against that set. On mismatch, shift to the next stated-weekday
+    occurrence inside [after, before); if no such occurrence exists,
+    return None to signal a drop. Other categories pass through unchanged
+    (they can opt in here later if mis-stamping shows up).
+    """
+    if item.category not in _WEEKLY_GATED_CATEGORIES:
+        return item
+    stated = _stated_weekdays(item)
+    if not stated:
+        return item
+    current = _ensure_utc(item.starts_at)
+    if current.weekday() in stated:
+        return item
+    if after is None or before is None:
+        return None
+    after_u = _ensure_utc(after)
+    before_u = _ensure_utc(before)
+    candidate = after_u.replace(
+        hour=current.hour,
+        minute=current.minute,
+        second=0,
+        microsecond=0,
+    )
+    while candidate < after_u:
+        candidate += timedelta(days=1)
+    while candidate < before_u:
+        if candidate.weekday() in stated:
+            return item.model_copy(update={"starts_at": candidate})
+        candidate += timedelta(days=1)
+    return None
+
+
 def _extract_json_text(response: Any) -> str | None:
     for block in getattr(response, "content", []):
         text = getattr(block, "text", None)
@@ -434,21 +595,26 @@ class LLMEventSource:
         self._fanout_per_bucket = fanout_per_bucket
         self._fanout_site_k = fanout_site_k
 
-    async def _run_searches(self, query: EventQuery) -> list[SearchResult]:
-        """Fan out to several Tavily searches and round-robin merge.
+    async def _run_searches(
+        self, query: EventQuery,
+    ) -> list[tuple[str, list[SearchResult]]]:
+        """Fan out to several Tavily searches and return labeled buckets.
 
         If the caller pinned `query.categories`, we honor that and do a
-        single search. Otherwise we dispatch in parallel:
+        single search (returned as one bucket). Otherwise we dispatch in
+        parallel:
           - one query per `_FANOUT_BUCKETS` entry (category-shaped query)
           - one query per `_FANOUT_SITES` entry (generic query restricted
             to that platform's domain via Tavily `include_domains`)
-        Results are round-robin merged so no single source or category
-        dominates, then deduped by URL.
+        Each bucket preserves its own results. URLs are deduplicated
+        across buckets on a first-come basis so the same page is never
+        extracted twice.
         """
         if query.categories:
             q = _build_search_query(query)
             logger.info("tavily search: %r (k=%d)", q, self._search_k)
-            return await self._search.search(q, k=self._search_k)
+            results = await self._search.search(q, k=self._search_k)
+            return [("pinned", results)]
 
         cat_queries: list[tuple[str, str, list[str] | None]] = [
             (
@@ -485,60 +651,66 @@ class LLMEventSource:
             )
         )
 
-        merged: list[SearchResult] = []
         seen: set[str] = set()
-        max_len = max((len(rs) for rs in result_lists), default=0)
-        for i in range(max_len):
-            for rs in result_lists:
-                if i >= len(rs):
-                    continue
-                r = rs[i]
+        labeled: list[tuple[str, list[SearchResult]]] = []
+        for (label, _, _), rs in zip(jobs, result_lists):
+            bucket: list[SearchResult] = []
+            for r in rs:
                 if r.url in seen:
                     continue
                 seen.add(r.url)
-                merged.append(r)
+                bucket.append(r)
+            labeled.append((label, bucket))
         per_bucket_counts = ",".join(
-            f"{label}={len(rs)}"
-            for (label, _, _), rs in zip(jobs, result_lists)
+            f"{label}={len(rs)}->{len(bk)}"
+            for (label, bk), rs in zip(labeled, result_lists)
         )
         logger.info(
-            "tavily fanout: per-bucket [%s] unique=%d",
-            per_bucket_counts, len(merged),
+            "tavily fanout: per-bucket raw->unique [%s] total_unique=%d",
+            per_bucket_counts, sum(len(bk) for _, bk in labeled),
         )
-        return merged
+        return labeled
 
     async def search(self, query: EventQuery) -> list[Event]:
-        results = await self._run_searches(query)
-        if not results:
+        buckets = await self._run_searches(query)
+        non_empty = [(label, rs) for label, rs in buckets if rs]
+        if not non_empty:
             return []
 
-        response = await self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=_EXTRACTOR_SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": _build_extractor_prompt(query, results)}
-            ],
-            output_config={
-                "format": {
-                    "type": "json_schema",
-                    "schema": anthropic.transform_schema(_LLMResponse),
-                }
-            },
+        extracted_lists = await asyncio.gather(
+            *(self._extract_one(query, label, rs) for label, rs in non_empty)
         )
-        raw = _extract_json_text(response)
-        if not raw:
-            return []
-        parsed = _parse_llm_response(raw)
-        if parsed is None:
-            return []
+
+        # Dedupe LLM items across buckets by content fingerprint so the
+        # same event surfaced by overlapping searches doesn't double-geocode.
+        seen_fp: set[str] = set()
+        items: list[_LLMEvent] = []
+        for sub in extracted_lists:
+            for it in sub:
+                fp = _fingerprint(it.title, _ensure_utc(it.starts_at), it.venue_name)
+                if fp in seen_fp:
+                    continue
+                seen_fp.add(fp)
+                items.append(it)
 
         events: list[Event] = []
-        out_of_bbox = out_of_window = 0
-        input_urls = {r.url for r in results}
+        out_of_bbox = out_of_window = wrong_weekday = 0
+        input_urls = {r.url for _, rs in non_empty for r in rs}
         touched_urls: set[str] = set()
-        for item in parsed.events:
+        for item in items:
             touched_urls.add(item.url)
+            resolved = _resolve_weekly_occurrence(
+                item, query.starts_after, query.starts_before,
+            )
+            if resolved is None:
+                wrong_weekday += 1
+                logger.info(
+                    "drop[weekday] %r starts=%s stated=%s",
+                    item.title, _ensure_utc(item.starts_at).isoformat(),
+                    sorted(_stated_weekdays(item)),
+                )
+                continue
+            item = resolved
             ev = await self._promote(item, query.near)
             if ev is None:
                 continue
@@ -560,7 +732,10 @@ class LLMEventSource:
                 )
                 continue
             events.append(ev)
-        capped = events[: query.limit]
+        # Return the full in-window inventory; the EventService orchestrator
+        # (and any CachedEventSource wrapping us) apply the caller's limit
+        # after merging across sources. Capping here would poison the cache
+        # with whatever limit the leader happened to request.
         same_host = 0
         for u in touched_urls:
             host = _host(u)
@@ -575,10 +750,46 @@ class LLMEventSource:
             len(input_urls),
         )
         logger.info(
-            "extracted=%d kept=%d capped=%d dropped(bbox=%d window=%d)",
-            len(parsed.events), len(events), len(capped), out_of_bbox, out_of_window,
+            "extracted=%d unique=%d kept=%d dropped(bbox=%d window=%d weekday=%d)",
+            sum(len(s) for s in extracted_lists), len(items),
+            len(events), out_of_bbox, out_of_window, wrong_weekday,
         )
-        return capped
+        return events
+
+    async def _extract_one(
+        self, query: EventQuery, label: str, results: list[SearchResult],
+    ) -> list[_LLMEvent]:
+        """Run one LLM extraction call against a single fanout bucket."""
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=_EXTRACTOR_SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user",
+                     "content": _build_extractor_prompt(query, results)}
+                ],
+                output_config={
+                    "format": {
+                        "type": "json_schema",
+                        "schema": anthropic.transform_schema(_LLMResponse),
+                    }
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("extract[%s] LLM call failed: %r", label, e)
+            return []
+        raw = _extract_json_text(response)
+        if not raw:
+            logger.info("extract[%s]: empty response", label)
+            return []
+        parsed = _parse_llm_response(raw)
+        if parsed is None:
+            logger.info("extract[%s]: unparseable response", label)
+            return []
+        logger.info("extract[%s]: %d events from %d results",
+                    label, len(parsed.events), len(results))
+        return list(parsed.events)
 
     async def _promote(self, item: _LLMEvent, near_hint: str | None) -> Event | None:
         coords = await self._geocode_item(item, near_hint)

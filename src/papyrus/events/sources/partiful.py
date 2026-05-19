@@ -50,6 +50,23 @@ _CATEGORY_KEYWORDS: tuple[tuple[EventCategory, tuple[str, ...]], ...] = (
     (EventCategory.concert, ("concert", "live music", "dj set", " plays ", "show w/")),
     (EventCategory.exhibition, ("gallery", "exhibition", "art show", "open studios")),
     (EventCategory.festival, ("festival", "fest ")),
+    (
+        EventCategory.tech,
+        (
+            "ai ", " ai", "a.i.", "ml ", " ml", "llm", "llms", "agent", "agents",
+            "agentic", "agi", "gpt", "claude", "openai", "anthropic",
+            "hackathon", "hack night", "hack day",
+            "web3", "crypto", "blockchain", "nft", "dao", "defi",
+            "founder", "founders", "startup", "startups", "yc ", "y combinator",
+            "demo day", "saas", "b2b", "vc ", " vc",
+            "developer", "developers", " dev ", " devs ",
+            "engineering", "engineer", "engineers",
+            "coding", "code ", "programming", "vibe coding",
+            "python", "javascript", "typescript", "rust", "golang",
+            "data science", "infra", "devtools", "open source",
+            "techweek", "tech week",
+        ),
+    ),
 )
 
 

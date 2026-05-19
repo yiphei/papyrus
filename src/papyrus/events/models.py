@@ -29,6 +29,7 @@ class EventCategory(str, Enum):
     exhibition = "exhibition"
     political = "political"
     community = "community"
+    tech = "tech"
     ugc = "ugc"
     other = "other"
 

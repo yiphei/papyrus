@@ -36,6 +36,21 @@ uv sync
 pnpm install
 ```
 
+### Optional: auto-activate the Python venv with direnv
+
+So you can run `python ...` / `pytest` / `ruff` directly instead of prefixing
+with `uv run`. A repo-tracked `.envrc` activates `.venv` on `cd` in.
+
+1. Install direnv: `brew install direnv` (or your package manager).
+2. Hook it into your shell — add to `~/.zshrc` (or `~/.bashrc`):
+   ```bash
+   eval "$(direnv hook zsh)"
+   ```
+3. From the repo root, run `direnv allow` once (direnv won't load untrusted
+   `.envrc` files automatically).
+
+Requires `.venv` to exist — run `uv sync` first.
+
 ### 4. Run, in two terminals
 
 Terminal A — backend on `:8000`:

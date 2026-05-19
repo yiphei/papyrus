@@ -77,16 +77,28 @@ export interface SizedPin extends ThinnedPin {
   iconSize: number
 }
 
+export interface ScreenPosition {
+  x: number
+  y: number
+  // Off-screen neighbors don't constrain a visible pin's size — a lone
+  // visible pin should be able to grow to fill the viewport regardless of
+  // where its off-screen kin sit.
+  visible: boolean
+}
+
 // Set icon-size per pin so each icon grows to fill the gap to its nearest
 // neighbor in pixel space — sparse pins get magnified, dense pins stay small.
 // Approximates each icon as a circle of radius (iconNativePx/2)*iconSize at
 // the pin point; two same-sized neighbors at distance D touch when iconSize
-// = D/iconNativePx, so that's the cap. A lone pin (no neighbors) takes
-// maxSize. minSize keeps icons readable in worst-case clusters at the cost
-// of slight overlap when neighbors land below the floor distance.
+// = D/iconNativePx, so that's the cap. A lone pin (no visible neighbors)
+// takes maxSize. minSize keeps icons readable in worst-case clusters at the
+// cost of slight overlap when neighbors land below the floor distance.
+//
+// `positions` are screen pixels from map.project(), so pitch/bearing/center
+// are already accounted for. positions[i] aligns with thinned[i].
 export function sizeByNearestNeighbor(
   thinned: readonly ThinnedPin[],
-  zoom: number,
+  positions: readonly ScreenPosition[],
   opts: { iconNativePx?: number; minSize?: number; maxSize?: number } = {},
 ): SizedPin[] {
   const iconNativePx = opts.iconNativePx ?? 110
@@ -95,16 +107,19 @@ export function sizeByNearestNeighbor(
   // typical viewport — the nearest-neighbor formula caps spread-out pins
   // organically, so this only kicks in for truly isolated ones.
   const maxSize = opts.maxSize ?? 15
-  const positions = thinned.map(({ event }) => lngLatToPx(event.lng, event.lat, zoom))
   return thinned.map((pin, i) => {
+    const p = positions[i]
     let nearestDsq = Number.POSITIVE_INFINITY
-    const [x, y] = positions[i]
-    for (let j = 0; j < positions.length; j++) {
-      if (j === i) continue
-      const dx = x - positions[j][0]
-      const dy = y - positions[j][1]
-      const dsq = dx * dx + dy * dy
-      if (dsq < nearestDsq) nearestDsq = dsq
+    if (p) {
+      for (let j = 0; j < positions.length; j++) {
+        if (j === i) continue
+        const q = positions[j]
+        if (!q.visible) continue
+        const dx = p.x - q.x
+        const dy = p.y - q.y
+        const dsq = dx * dx + dy * dy
+        if (dsq < nearestDsq) nearestDsq = dsq
+      }
     }
     const raw = nearestDsq === Number.POSITIVE_INFINITY
       ? maxSize

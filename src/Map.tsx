@@ -31,7 +31,7 @@ export default function MapView() {
       near: 'San Francisco',
       startsAfter: now,
       startsBefore: in2Days,
-      limit: 15,
+      limit: 200,
     }
   }, [])
 

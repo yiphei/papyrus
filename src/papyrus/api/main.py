@@ -15,6 +15,7 @@ from ..events import EventCategory, EventQuery, EventService
 from ..events.cache import CachedEventSource
 from ..events.sources.llm import LLMEventSource
 from ..events.sources.luma import LumaEventSource
+from ..events.sources.partiful import PartifulEventSource
 
 
 def create_app(service: EventService) -> FastAPI:
@@ -92,7 +93,8 @@ def _build_default_service() -> EventService:
     cache_ttl = float(os.environ.get("PAPYRUS_CACHE_TTL_S", "900"))
     cached_llm = CachedEventSource(llm, ttl_seconds=cache_ttl)
     cached_luma = CachedEventSource(LumaEventSource(), ttl_seconds=cache_ttl)
-    return EventService(sources=[cached_llm, cached_luma])
+    cached_partiful = CachedEventSource(PartifulEventSource(), ttl_seconds=cache_ttl)
+    return EventService(sources=[cached_llm, cached_luma, cached_partiful])
 
 
 app = create_app(_build_default_service())

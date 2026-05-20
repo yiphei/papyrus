@@ -11,6 +11,7 @@ import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 import { rankEvents, thinByPixelSeparation } from './thinning'
 import { useIconSizingLoop, EVENTS_SOURCE_ID } from './useIconSizingLoop'
+import { useFocusedEvent } from './useFocusedEvent'
 
 const EVENTS_LAYER_ID = 'events-layer'
 
@@ -98,6 +99,11 @@ export default function MapView() {
     thinned,
     enabled: mapLoaded && iconsReady,
     iconIdFor,
+  })
+  const { focusedEvent } = useFocusedEvent({
+    map,
+    thinned,
+    enabled: mapLoaded && iconsReady,
   })
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
@@ -253,6 +259,18 @@ export default function MapView() {
         onToggle={toggleCategory}
         onReset={() => setActiveCats(null)}
       />
+
+      <FocusedEventPanel ev={focusedEvent} />
+    </div>
+  )
+}
+
+function FocusedEventPanel({ ev }: { ev: LiveEvent | null }) {
+  if (!ev) return null
+  return (
+    <div className="focused-event-panel">
+      <h3>{ev.title}</h3>
+      {ev.description && <p>{ev.description}</p>}
     </div>
   )
 }

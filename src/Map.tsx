@@ -14,9 +14,9 @@ import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thin
 const EVENTS_LAYER_ID = 'events-layer'
 
 // Proximity-to-center magnification: a pin at the map center renders at its
-// full nearest-neighbor size; a pin at the viewport edge shrinks to this
-// fraction of it. Linear falloff between, normalized to half the smaller
-// viewport dimension.
+// full nearest-neighbor / position cap; a pin at the viewport edge shrinks
+// to this fraction of it. Linear falloff between, normalized to half the
+// smaller viewport dimension.
 const PROXIMITY_MIN_FACTOR = 0.4
 
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
@@ -109,29 +109,43 @@ export default function MapView() {
     () => thinByPixelSeparation(ranked, settledZoom),
     [ranked, settledZoom],
   )
-  // Sizing has two clamps stacked:
-  //   1. sizeByNearestNeighbor caps each pin by half its nearest-neighbor
-  //      distance (no inter-pin collision).
+  // Sizing has three clamps stacked:
+  //   1. sizeByNearestNeighbor caps each pin by half its distance to the
+  //      nearest *visible* neighbor (no inter-pin collision; off-screen
+  //      pins don't constrain on-screen ones, so a lone visible pin can
+  //      grow to maxSize even when its kin sit far off-screen).
   //   2. A per-pin screen-position cap: with icon-anchor='bottom' the icon
   //      extends upward by iconSize*110 from the pin, so available upward
   //      space is `y` to the top of the viewport; horizontally it's
   //      centered, so available is `2 × min(x, vw - x)`. The smaller of
   //      the two divided by 110 is the position cap. This is what stops a
   //      lone-visible pin at deep zoom from blowing past the viewport.
+  //   3. Proximity-to-center magnification: linear falloff from 1.0 at the
+  //      center to PROXIMITY_MIN_FACTOR at the viewport edge. Pins close
+  //      to the center stay at their natural cap; pins toward the edge
+  //      miniaturize.
   const pins = useMemo(() => {
     const map = mapRef.current?.getMap()
-    if (!map) return sizeByNearestNeighbor(thinned, zoom)
+    if (!map) return sizeByNearestNeighbor(thinned, [])
     const canvas = map.getCanvas()
     const vw = canvas.clientWidth
     const vh = canvas.clientHeight
-    const sized = sizeByNearestNeighbor(thinned, zoom, {
+    // Project once per frame; reused for visibility test, sizing input,
+    // and the per-pin position cap below. map.project() honors
+    // pitch/bearing/center, unlike the Web Mercator world-pixel projection
+    // used inside the thinning pass.
+    const projected = thinned.map((pin) => {
+      const { x, y } = map.project([pin.event.lng, pin.event.lat])
+      return { x, y, visible: x >= 0 && x <= vw && y >= 0 && y <= vh }
+    })
+    const sized = sizeByNearestNeighbor(thinned, projected, {
       maxSize: Math.min(vw, vh) / 110,
     })
     const cx = vw / 2
     const cy = vh / 2
     const halfMin = Math.min(vw, vh) / 2
-    return sized.map((pin) => {
-      const { x, y } = map.project([pin.event.lng, pin.event.lat])
+    return sized.map((pin, i) => {
+      const { x, y } = projected[i]
       const verticalCap = Math.max(0, y) / 110
       const horizontalCap = (2 * Math.max(0, Math.min(x, vw - x))) / 110
       const positionCap = Math.min(verticalCap, horizontalCap)

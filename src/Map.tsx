@@ -7,7 +7,7 @@ import MapGL, {
   type MapRef,
 } from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
-import { ensureEmojiIcon } from './iconLoader'
+import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
 
@@ -63,7 +63,7 @@ const CATEGORY_ORDER: EventCategory[] = [
 ]
 
 function iconIdFor(ev: LiveEvent): string {
-  return `event-emoji-${ev.category}`
+  return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
 export default function MapView() {
@@ -188,13 +188,25 @@ export default function MapView() {
     if (!mapLoaded) return
     const map = mapRef.current?.getMap()
     if (!map || events.length === 0) return
+    let cancelled = false
 
-    for (const ev of events) {
-      const id = iconIdFor(ev)
-      if (map.hasImage(id)) continue
-      ensureEmojiIcon(map, id, CATEGORY_EMOJI[ev.category])
+    setIconsReady(false)
+    Promise.all(
+      events.map(async (ev) => {
+        const id = iconIdFor(ev)
+        if (map.hasImage(id)) return
+        if (ev.image_url) await ensureAssetIcon(map, id, ev.image_url)
+        else ensureEmojiIcon(map, id, CATEGORY_EMOJI[ev.category])
+      }),
+    )
+      .then(() => {
+        if (!cancelled) setIconsReady(true)
+      })
+      .catch((e) => console.error('Failed to load event icons', e))
+
+    return () => {
+      cancelled = true
     }
-    setIconsReady(true)
   }, [mapLoaded, events])
 
   const handleClick = (e: MapMouseEvent) => {

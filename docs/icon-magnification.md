@@ -22,7 +22,7 @@ These hold at all times, on every frame:
 1. **No overlap.** For any two visible icons, the sum of their on-screen radii is less than or equal to their on-screen center-to-center distance. (Each icon is treated as a disk for collision purposes, even though the artwork is rectangular — the disk model is conservative.)
 2. **Bounded maximum.** No icon ever renders larger than a fixed fraction of the smaller viewport dimension, regardless of how isolated it is. This ceiling prevents a lone pin from blowing through the viewport entirely.
 3. **Bounded minimum.** No icon shrinks below a fixed floor. Below that the icon would become unclickable and visually meaningless.
-4. **Center wins.** When two pins are close enough that they would overlap at full size, the one nearer to the screen center takes priority and grows; the further one shrinks to fit. (The fixed-point alternative — both pins compromise to a balanced mid-size — is explicitly rejected.)
+4. **Center wins.** When two pins are close enough that they would overlap at full size, the one nearer to the screen center takes priority and grows; the further one shrinks to fit. The brief crossover band, where the two pins are within `CROSSOVER_BLEND_PX` of equidistant from center, is an exception: the two sizes meet at a transient midpoint while the camera passes through. Steady-state balanced sizing — both pins permanently at a compromise mid-size, as a symmetric fixed-point solver would produce — is still explicitly rejected.
 5. **Axes are symmetric.** Moving an icon horizontally has the same effect on its size as moving it vertically by the same number of pixels. There is no axis bias.
 6. **Stable visible set during a gesture.** Which icons are visible is decided once, when a gesture ends; sizes update continuously during the gesture, but the set of pins doesn't pop in and out.
 
@@ -35,7 +35,7 @@ For each frame during a pan or zoom gesture (and once when the gesture settles),
 1. Each thinned pin is projected from its geographic coordinate into a pixel position on the current canvas.
 2. For each pin, a **proximity factor** is computed — a multiplier in a small range that depends only on how far the pin is from the screen center.
 3. For each pin, a **position cap** is computed — a geometric ceiling that prevents the icon from extending too far past the viewport edges.
-4. A **greedy overlap solver** walks the pins in order of proximity (closest to center first), assigning each pin its largest allowed size given the position cap, the absolute maximum, and the constraint that it must not overlap any pin already placed.
+4. A **pairwise overlap solver** computes each pin's base size as a smooth blend of two greedy assignments per neighbor ("this pin wins the pair" vs "the other pin wins"). At the extremes the blend collapses to plain greedy (closer pin at full allowance, farther pin at the constrained leftover); across the crossover it interpolates continuously, eliminating the one-frame winner-swap.
 5. Each pin's final rendered size is its solver-assigned base size multiplied by its proximity factor.
 6. From the final rendered size, an **anchor lift** is computed — a vertical offset that smoothly shifts the icon's visual position from "bottom of artwork sitting at the coord" (for small icons) toward "icon centered on the coord" (for large icons).
 7. The sizes and offsets are pushed to Mapbox as feature properties; the symbol layer reads them via plain `get` expressions.
@@ -64,7 +64,7 @@ A natural implementation would fold proximity into the overlap constraint itself
 - The user expects the **center pin** to reach the **absolute maximum**, not a proximity-scaled fraction of it.
 - A symmetric or proximity-weighted constraint causes two nearby pins to converge to a balanced size; neither reaches the maximum.
 
-Keeping the proximity factor as a post-multiplier, applied only when computing the final rendered size, lets the greedy solver hand the center pin its full allowance while the proximity factor naturally shrinks pins further from the center.
+Keeping the proximity factor as a post-multiplier, applied only when computing the final rendered size, lets the overlap solver hand the center pin its full allowance while the proximity factor naturally shrinks pins further from the center.
 
 ## 5. The position cap
 
@@ -87,9 +87,9 @@ The position cap has no dependence on the icon's current size estimate. It is pu
 
 A configurable cap on rendered size, expressed as a fraction of the smaller viewport dimension. This is what makes "lone pin at center fills ~80% of the screen" a stable target — without it, a sufficiently isolated pin would have nothing to limit its growth except the position cap, which at center is large.
 
-The absolute maximum is the size a lone pin gets when it is at the screen center. The greedy solver caps every pin's allocation at this value before applying any pairwise constraint.
+The absolute maximum is the size a lone pin gets when it is at the screen center. The solver caps every pin's `ucMax` (unconstrained max) at this value before applying any pairwise constraint.
 
-## 7. The greedy overlap solver
+## 7. The overlap solver
 
 This is the core algorithm and the one most likely to be incorrectly "improved." Read this section carefully.
 
@@ -99,20 +99,30 @@ The solver assigns each pin a **base size**: the multiplier the symbol layer wil
 
 ### How it does it
 
-1. The pins are sorted by their proximity factor, descending. The pin nearest the screen center is first; the pin furthest from center is last.
-2. The solver walks the sorted list in order, assigning each pin its size:
-   - The candidate cap starts at the minimum of the absolute maximum and the pin's position cap.
-   - For every pin earlier in the order — that is, every pin already assigned a size — the solver checks the pairwise overlap constraint. If the constraint would be violated at the candidate cap, the cap is reduced to whatever value satisfies it.
-   - The final assigned size is the candidate cap, floored at the minimum size.
-3. Once assigned, a pin's size is fixed. Subsequent pins must work around it; it does not get re-evaluated.
+For each pin `i`:
 
-### Why greedy and not a fixed-point relaxation
+1. Compute the **unconstrained max** `ucMax[i] = min(absMax, posCap[i])` — the size pin `i` would have with no neighbors.
+2. For every other pin `j`, compute a pairwise cap that blends two greedy assignments — "pin `i` wins the pair" and "pin `j` wins the pair":
+   - `shrunk_ij` = the size pin `i` would have if pin `j` takes its full `ucMax[j]` first, i.e. the leftover that plain greedy would give pin `i` when pin `j` is sized first: `(2 × D_ij / native_icon_pixels − ucMax[j] × proximity_j) / proximity_i`, floored at `MIN_SIZE`.
+   - `s_ij` = pin `i`'s share of the pair, computed as `smoothstep((dc[j] − dc[i] + CROSSOVER_BLEND_PX) / (2 × CROSSOVER_BLEND_PX))`, where `dc[i]` is the screen-pixel distance from pin `i` to the viewport center. The value is 1 when pin `i` is at least `CROSSOVER_BLEND_PX` closer to center than pin `j`, 0 when at least that much farther, smoothstep in between. By construction `s_ij + s_ji = 1` exactly.
+   - `pairCap_ij = s_ij × ucMax[i] + (1 − s_ij) × shrunk_ij`.
+3. `base[i] = max(MIN_SIZE, min over j of pairCap_ij)`.
 
-A fixed-point solver iterates: each pin's size is recomputed against the current sizes of all neighbors; after a few passes, the sizes converge.
+At the extremes (`s_ij = 0` or `1`), the formulation reduces to plain greedy: the closer pin is at `ucMax`, the farther pin is at the leftover. The center pin still reaches absolute max in steady state. Across the crossover (`s_ij ≈ 0.5`), both pins land at the midpoint between their winning and losing sizes, and the assignment moves continuously between the two extremes as the camera pans. This continuity is the whole point — the older implementation sorted the pins, walked the list in order, and produced a discrete winner-swap any time two pins' proximity factors crossed during a pan. The user saw it as a one-frame jump in both icons' sizes; the pair-blend eliminates it.
 
-The fixed-point solver produces **balanced** sizing. Two pins close enough that they constrain each other end up at similar sizes, with neither reaching the absolute maximum. This was the previous implementation. The user evaluated it visually and rejected it: "the centered icon needs to be rendered in max size, and the icon to the right should be smaller." A symmetric fixed-point cannot deliver that, because by construction it treats both pins symmetrically.
+### Why not a fixed-point relaxation
 
-The greedy solver delivers asymmetric priority: the center pin "wins" because it is sized first, with no constraints to bind it. Subsequent pins are constrained by what the center pin took.
+A symmetric fixed-point solver iterates per-pin sizes against neighbors until convergence and produces **balanced** sizing: two pins close enough to constrain each other end at similar sizes, with neither reaching the absolute maximum. This was tried in an earlier iteration and the user rejected it visually: "the centered icon needs to be rendered in max size, and the icon to the right should be smaller." A symmetric fixed-point cannot deliver that.
+
+The pair-blend keeps the asymmetric "center wins" property outside the crossover band: when `s_ij` is 1, pin `i` is at `ucMax` and pin `j` is at the constrained leftover, identical to plain greedy. Inside the crossover band (when `|dc[i] − dc[j]| < CROSSOVER_BLEND_PX`) the asymmetry softens into a smooth handoff, which is the only place where balanced sizing applies — and only transiently, while the camera is passing through the crossover.
+
+### Why not a hash-based stable tiebreaker
+
+An obvious cheap "fix" for the swap is to add a stable tiebreaker (such as a hash of the event ID) so that ties resolve consistently. This was tried in spirit by an earlier sort-hysteresis scheme; both share the same flaw. Two pins pass through exact proximity equality only on isolated frames of float-arithmetic flukes; the visible jump is caused by the *near*-equal crossover where the sort algorithm flips its result, not by exact ties. Stable tiebreaking does nothing for the near-equal case. The pair-blend does, because it makes the per-pin size a continuous function of every pin's screen position rather than the discrete output of a sort.
+
+### Why not sort-order hysteresis
+
+A hysteresis on the sort comparator (preserve the previous frame's order while the proximity-factor gap sits inside a dead-band) was the prior implementation. It made small pans around the crossover stable, but a decisive pan past the dead-band produced the same one-frame swap as the un-hysteresis greedy — the jump was merely delayed to a slightly larger proximity gap. At zoom levels where the gap traverses the dead-band quickly, the user still saw the discontinuity. The pair-blend removes the jump entirely because there is no discrete decision to delay.
 
 ### The pairwise overlap constraint
 
@@ -120,15 +130,13 @@ For two pins, the rendered sizes (base × proximity) and the inter-pin pixel dis
 
 > rendered_i × native_icon_pixels / 2  +  rendered_j × native_icon_pixels / 2  ≤  pixel_distance_ij
 
-That is: the sum of the two on-screen radii is at most the on-screen distance. Solving for the size of pin i, given an already-fixed pin j, this rearranges to give an upper bound on the base size of pin i in terms of pin j's known rendered size.
+That is: the sum of the two on-screen radii is at most the on-screen distance. The pair-blend formulation makes this an *equality* (modulo `MIN_SIZE` flooring) at every value of `s_ij`: pick any blend, write out the two rendered sizes, and the cross terms cancel. The two pins together always use exactly the budget `2 × D / native_icon_pixels` when they constrain each other.
 
-The constraint is **pairwise**, not cluster-aware. With three or more pins arranged in a tight cluster, the greedy order matters — the second pin's size is constrained only by the first; the third by the first and the second; and so on. This is sufficient for the visible-pin counts we deal with (a few dozen at most) and easy to reason about.
+The constraint is **pairwise**, not cluster-aware. In a tight three-or-more-pin cluster, pin `i`'s pair-cap against pin `j` uses `ucMax[j]` (the worst case for pin `i`), even if pin `j` is itself shrunk by another neighbor. The result is occasionally a slightly smaller third+ pin than a globally optimal sizer would produce. For the visible-pin counts we deal with (a few dozen at most), the effect is small and visually acceptable.
 
-### Tie-breaking
+### Tuning
 
-Two pins at almost-identical distance from the screen center are sorted with no particular preference between them. As the user pans, their proximity-factor order can flip, and the greedy assignment will swap which one is "winner." For most clusters this is invisible (their factors are similar, so their sizes are similar). For obvious symmetric arrangements — two pins equidistant on opposite sides of the center — the swap can cause a small visible pop.
-
-A stable tiebreaker (such as a hash of the event ID) would dampen this, at the cost of slightly less responsive ordering. The current code does not implement a tiebreaker; add one if the popping becomes user-visible.
+`CROSSOVER_BLEND_PX` is the half-width of the smooth crossover zone, in screen pixels. Wider means a longer "co-dominant" zone during a pan and more time spent at the blend midpoint; narrower brings behavior closer to plain greedy at the cost of a sharper crossover. Adjust by visual evaluation in the running app, not in the abstract.
 
 ## 8. The anchor lift
 
@@ -162,7 +170,7 @@ For each pin on each frame:
 
 > rendered_size_i  =  proximity_factor_i  ×  base_size_i
 
-where base_size_i comes from the greedy solver, and proximity_factor_i depends only on the pin's screen position.
+where base_size_i comes from the overlap solver, and proximity_factor_i depends only on the pin's screen position.
 
 > visual_lift_i  =  smooth_ramp(rendered_size_i)  ×  native_canvas_half_height
 
@@ -174,7 +182,7 @@ The symbol layer reads rendered_size_i as `icon-size` and (0, visual_lift_i) as 
 
 ### A single, isolated pin centered on screen
 
-The greedy order has just one entry. The position cap at the center is loose. The candidate cap reduces to the absolute maximum. The proximity factor is 1. Final rendered size equals the absolute maximum. The icon fills ~80% of the smaller viewport dimension. The anchor lift is at full, so the icon is centered on the coord.
+No pairwise constraints apply. `ucMax` is the absolute maximum. The proximity factor is 1. Final rendered size equals the absolute maximum. The icon fills ~80% of the smaller viewport dimension. The anchor lift is at full, so the icon is centered on the coord.
 
 ### A single pin at the corner of the viewport
 
@@ -182,23 +190,23 @@ Position cap is at or near zero (the pin is at an edge). Proximity factor is at 
 
 ### Two pins, both at screen center
 
-Pathological but possible during dense thinning glitches. Both pins have proximity factor 1. The greedy order is arbitrary. One pin is sized first to the absolute maximum; the second is constrained to a tiny size (or the minimum floor) by the pairwise constraint. Visually: one big icon, one almost-invisible icon directly underneath. Acceptable degenerate behavior — the thinning step is supposed to prevent this configuration, so seeing it indicates a thinning bug rather than a sizing bug.
+Pathological but possible during dense thinning glitches. Both pins have proximity factor 1 and `dc = 0`, so `s_ij = 0.5` and `shrunk_ij` is negative (forced to `MIN_SIZE`). Both pins collapse to roughly the minimum-floor size. Visually: two almost-invisible icons on top of each other. Acceptable degenerate behavior — the thinning step is supposed to prevent this configuration, so seeing it indicates a thinning bug rather than a sizing bug.
 
 ### Two pins at equal distance from the center, on opposite sides
 
-Their proximity factors are equal. The greedy order is determined by whatever tiebreaker the sort uses (currently none — order is whatever the sort algorithm produces for equal keys). The "winner" gets the larger size. As the user pans, the order can flip and the size assignment swaps. With current code, this produces a brief visible pop. A stable tiebreaker would prevent this.
+Their distance-to-center difference is zero, so `s_ij = 0.5` for the pair. Each pin's pairwise cap is the arithmetic mean of `ucMax` and `shrunk` — neither pin reaches absolute max, both land at the midpoint between the two greedy assignments. As the user pans, `s_ij` slides smoothly toward 0 or 1, and the two pins move continuously between the midpoint and the standard "one at max, other at leftover" assignment. No jump.
 
 ### A dense cluster of many pins
 
-The greedy walk produces a clear hierarchy: the centermost pin is at full size; each subsequent pin is shrunk by the prior pin's footprint. In a tight cluster, all pins beyond the first few converge to the minimum size. Visually: one dominant icon and a halo of tiny ones. This is the intended "focus" effect.
+The pair-blend produces a clear hierarchy: the centermost pin is at `ucMax`; each other pin's `pairCap` against the central one is `shrunk` (constrained by the central pin's full footprint). In a tight cluster, all pins beyond the first few floor at the minimum size. Visually: one dominant icon and a halo of tiny ones. This is the intended "focus" effect.
 
 ### Panning an icon from screen center to the edge
 
-Proximity factor decreases smoothly via the smoothstep curve. Position cap decreases smoothly as the pin nears the edge. The greedy order may re-shuffle when the pin's proximity drops below another pin's. The icon's size decreases smoothly throughout. No pop.
+Proximity factor decreases smoothly via the smoothstep curve. Position cap decreases smoothly as the pin nears the edge. The pin's `s_ij` against any neighbor slides smoothly as its distance-to-center changes. The icon's size decreases smoothly throughout. No pop.
 
 ### Zooming in or out
 
-The thinned set is recomputed when the gesture settles, not continuously. During the zoom gesture, the same set of pins is visible, and they re-size continuously. When the gesture ends, the visible set may change (more pins at high zoom, fewer at low zoom). On the next frame, the greedy solver runs over the new set; new pins are sized fresh.
+The thinned set is recomputed when the gesture settles, not continuously. During the zoom gesture, the same set of pins is visible, and they re-size continuously. When the gesture ends, the visible set may change (more pins at high zoom, fewer at low zoom). On the next frame, the overlap solver runs over the new set; new pins are sized fresh.
 
 ### Resizing the browser window
 
@@ -255,10 +263,10 @@ If a future change causes any of these symptoms, the change is wrong:
 
 - **Flicker during pan.** Almost certainly caused by per-frame updates going through React's render cycle, or by toggling the GeoJSON source via a controlled component prop. The per-frame loop must call `setData()` directly.
 - **Y-axis dominates magnification.** The position cap is using anchor-aware (asymmetric) geometry instead of the symmetric formula. Make sure both axes use the same "twice the distance to the nearer edge" form.
-- **The center pin never reaches max size when a neighbor is on-screen.** The solver is being run as a symmetric fixed-point instead of a greedy walk. Switch to the priority-ordered greedy assignment.
+- **The center pin never reaches max size when a neighbor is on-screen.** `CROSSOVER_BLEND_PX` is too wide (the center pin is being held in the blend midpoint instead of reaching `ucMax`) or the pair-blend has regressed to a symmetric fixed-point that doesn't reduce to `s_ij = 1 → ucMax` at the extremes.
 - **Magnification feels too aggressive on small pans.** The proximity factor's curve is linear or too steep near zero. Use smoothstep (or a higher-order ease) so the factor is flat near the center.
 - **The icon pops visibly as it crosses some size threshold.** The anchor handling is switching `icon-anchor` discretely instead of ramping the offset continuously. Use the continuous offset.
-- **Two equidistant pins swap sizes mid-pan.** The greedy sort has no stable tiebreaker. Add a hash-based one.
+- **Two near-equidistant pins swap sizes discontinuously during a pan.** The pair-blend has regressed to a hard sort. Verify `computeSizes()` is using `s_ij × ucMax + (1 − s_ij) × shrunk` and that `CROSSOVER_BLEND_PX` is non-zero. Symptom is a one-frame jump rather than a smooth interpolation across the crossover.
 - **The location dot/stem is back at the bottom of the artwork and drifts as the icon grows.** See Section 8.
 
 ## 15. Things this system deliberately does not do
@@ -270,7 +278,7 @@ If a future change causes any of these symptoms, the change is wrong:
 
 ## 16. Open trade-offs left in place
 
-- **No stable tiebreaker in the proximity sort.** Two pins at near-identical distance from center can swap order during pan; in rare cases this is visible.
+- **In the crossover band, neither pin reaches absolute max.** Both sit at the blended midpoint between `ucMax` and `shrunk`. This is the price of continuity; outside the band the closer pin still reaches `ucMax`. The band width (`CROSSOVER_BLEND_PX`) is tunable.
+- **The pair-blend is not globally optimal.** Each pairwise cap is computed against a neighbor's `ucMax` (the worst case for the pin in question), not the neighbor's actual constrained size. In tight three-or-more-pin clusters this slightly over-shrinks the third+ pin compared to a globally optimal sizer. Not a problem in practice for the visible-pin counts we deal with.
 - **Small icons near the top edge can clip a few pixels off-screen.** A consequence of the symmetric position cap; deemed acceptable because the proximity factor shrinks edge pins anyway, bounding the excursion.
 - **No "importance"-weighted sizing.** A future product call may want the center icon's importance to factor into how aggressively it dominates. Currently importance only affects visibility.
-- **Greedy is order-dependent, not globally optimal.** For pathological cluster geometries, the greedy walk can produce sizes that a globally optimal solver would do differently. Not a problem in practice for the visible-pin counts we deal with.

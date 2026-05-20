@@ -1,11 +1,15 @@
 // Per-pin icon sizing for the map's event symbol layer.
 //
 // The user-visible invariants this module enforces:
-//   1. No two icons ever overlap (anti-overlap solved by a one-pass greedy
-//      sweep: pins are sorted by proximity to screen center; the center pin
-//      takes its full allowance first, later pins shrink to fit around
-//      already-sized neighbors). Deliberately asymmetric — see the
-//      computeSizes() comment for why fixed-point relaxation was rejected.
+//   1. No two icons ever overlap. Pairwise allocation between any two pins
+//      is the smooth blend of the two greedy orderings ("i wins the pair" vs
+//      "j wins the pair"), weighted by their relative distance to screen
+//      center. At the extremes the closer pin reaches its full allowance and
+//      the farther pin gets the leftover; in between, both interpolate
+//      continuously. The result is a single-pass, stateless, per-pin size
+//      that is a continuous function of every pin's position — no winner-swap
+//      jump when two pins pass through near-equal proximity during a pan.
+//      See the computeSizes() comment for the formula.
 //   2. Pins near the screen center magnify; pins farther away miniaturize.
 //      The falloff is a smoothstep across the viewport diagonal, so tiny
 //      pans don't perturb center pins.
@@ -47,6 +51,14 @@ export const ANCHOR_RAMP_HIGH = 4.0
 
 // Minimum size floor. Matches the old MIN_PIXEL_SEPARATION (20) / 110.
 export const MIN_SIZE = 20 / ICON_NATIVE_PX
+
+// Half-width (in screen pixels) of the pair-blend zone in computeSizes. For
+// two pins whose distances-to-screen-center differ by less than CROSSOVER_BLEND_PX,
+// the pair-allocation blends smoothly between the two greedy orderings
+// ("i wins the pair" ↔ "j wins the pair"); outside the band it collapses to
+// plain greedy. Larger value = wider smooth crossover, slower handoff. See
+// docs/icon-magnification.md §7.
+export const CROSSOVER_BLEND_PX = 80
 
 function clamp01(x: number): number {
   if (x < 0) return 0
@@ -135,17 +147,35 @@ export interface SizingResult {
 // Compute per-pin iconSize + offsetY for the current camera. Pure: takes a
 // project function and viewport dimensions; doesn't touch Mapbox state.
 //
-// Algorithm:
+// Algorithm: a single-pass, stateless variant of greedy sizing where each
+// pairwise constraint is the smooth blend of the two possible greedy orderings
+// for that pair ("i wins the pair" vs "j wins the pair").
+//
 //   1. Project every thinned pin to screen pixels.
-//   2. Compute per-pin proximityFactor (independent).
-//   3. Greedy sweep in priority order: walk pins sorted by proximity factor
-//      descending. Each pin gets the largest base size that respects ABS_MAX,
-//      its positionCap, and the pairwise no-overlap constraint against
-//      already-sized neighbors. The center pin reaches max; later pins
-//      shrink. (Rejected alternative: symmetric fixed-point relaxation,
-//      which lets neighbors converge to balanced mid-sizes and never lets
-//      the center pin hit max.)
-//   4. Final iconSize = base × proximityFactor; offsetY computed from it.
+//   2. Compute per-pin proximityFactor and the unconstrained max ucMax =
+//      min(absMax, positionCap). ucMax is "what this pin would be if it had
+//      no neighbors."
+//   3. For each ordered pair (i, j):
+//        s_ij = smoothstep over (dc_j - dc_i) where dc = distance to screen
+//          center. s_ij + s_ji = 1 exactly; s_ij is 1 when i is at least
+//          CROSSOVER_BLEND_PX closer to center than j, 0 when at least that
+//          much farther, smoothstep in between.
+//        shrunk_ij = the size pin i would have if pin j takes its full ucMax
+//          first: (2 D / N - ucMax[j] * p[j]) / p[i], floored at MIN_SIZE.
+//        pairCap_ij = s_ij * ucMax[i]  +  (1 - s_ij) * shrunk_ij.
+//      At s_ij = 1 (i clearly wins) this is ucMax[i] — pin i reaches absMax,
+//      pin j collapses to the proper leftover (matching plain greedy). At
+//      s_ij = 0 it is shrunk_ij — pin i collapses, pin j reaches absMax. At
+//      s_ij = 0.5 it's the average — both pins land between the two extremes.
+//      The rendered no-overlap constraint rendered_i + rendered_j = 2 D / N
+//      holds exactly at every blend value (modulo MIN_SIZE flooring).
+//   4. base[i] = min over j of pairCap_ij, floored at MIN_SIZE.
+//   5. Final iconSize = base × proximityFactor; offsetY computed from it.
+//
+// This replaces an earlier greedy-with-sort-hysteresis approach. Hysteresis
+// only delayed the "winner swap" jump; the new formulation makes the entire
+// per-pin size a continuous function of every pin's position, so there is no
+// jump to delay. See docs/icon-magnification.md §7.
 export function computeSizes(
   thinned: readonly ThinnedPin[],
   project: (lng: number, lat: number) => { x: number; y: number },
@@ -162,8 +192,11 @@ export function computeSizes(
   const px = new Float64Array(N)
   const py = new Float64Array(N)
   const p = new Float64Array(N)
-  const posCap = new Float64Array(N)
+  const dc = new Float64Array(N)
+  const ucMax = new Float64Array(N)
   const absMax = (ABS_MAX_FRAC * Math.min(vw, vh)) / ICON_NATIVE_PX
+  const cx = vw / 2
+  const cy = vh / 2
 
   for (let i = 0; i < N; i++) {
     const { event } = thinned[i]
@@ -171,34 +204,30 @@ export function computeSizes(
     px[i] = x
     py[i] = y
     p[i] = proximityFactor(x, y, vw, vh)
-    // Position cap is symmetric across both axes (independent of the offset
-    // ramp). See positionCap docstring for why.
-    posCap[i] = positionCap(x, y, vw, vh)
+    dc[i] = Math.hypot(x - cx, y - cy)
+    ucMax[i] = Math.min(absMax, positionCap(x, y, vw, vh))
   }
 
-  // Greedy sizing in priority order: pins closer to the screen center (higher
-  // proximity factor) get sized first, taking their full allowed size; later
-  // pins shrink to fit against already-placed neighbors. This is intentionally
-  // asymmetric — a symmetric fixed-point solver lets two nearby pins converge
-  // to similar mid-sized values, but the user expectation is "the center pin
-  // is always full size; the others give way". Greedy delivers that.
-  const order = Array.from({ length: N }, (_, i) => i)
-  order.sort((a, b) => p[b] - p[a])
-
   const base = new Float64Array(N)
-  for (const i of order) {
-    let cap = Math.min(absMax, posCap[i])
-    // Only already-sized neighbors (those earlier in `order`) constrain this
-    // pin. Their sizes are fixed; this pin shrinks if needed to fit.
-    for (const j of order) {
+  const sigmaTwo = 2 * CROSSOVER_BLEND_PX
+  for (let i = 0; i < N; i++) {
+    let cap = ucMax[i]
+    for (let j = 0; j < N; j++) {
       if (j === i) continue
-      if (base[j] === 0) continue // not sized yet (later in order)
       const dx = px[i] - px[j]
       const dy = py[i] - py[j]
       const D = Math.hypot(dx, dy)
-      // Pairwise overlap constraint: size_i × p_i + size_j × p_j ≤ 2 D / N.
-      const ijCap = ((2 * D) / ICON_NATIVE_PX - base[j] * p[j]) / p[i]
-      if (ijCap < cap) cap = ijCap
+      // Pin i's size if pin j takes its full ucMax (= the leftover greedy
+      // would give pin i with pin j sized first).
+      const shrunk = Math.max(
+        MIN_SIZE,
+        ((2 * D) / ICON_NATIVE_PX - ucMax[j] * p[j]) / p[i],
+      )
+      // Smoothstep share for pin i: 1 when i is CROSSOVER_BLEND_PX closer to
+      // center than j, 0 when that much farther, smooth in between.
+      const s = smoothstep((dc[j] - dc[i] + CROSSOVER_BLEND_PX) / sigmaTwo)
+      const pairCap = s * ucMax[i] + (1 - s) * shrunk
+      if (pairCap < cap) cap = pairCap
     }
     base[i] = Math.max(MIN_SIZE, cap)
   }

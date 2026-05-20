@@ -105,3 +105,43 @@ html, body, #root {
 .cat-chip.reset:hover {
   background: #f3f4f6;
 }
+
+.centered-event-panel {
+  position: absolute;
+  top: 50%;
+  left: 16px;
+  transform: translateY(-50%);
+  width: 300px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  background: rgba(255, 255, 255, 0.97);
+  padding: 14px 16px;
+  border-radius: 10px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  z-index: 1;
+}
+
+.centered-event-panel h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.centered-event-panel .meta {
+  margin: 2px 0;
+  font-size: 12px;
+  color: #444;
+}
+
+.centered-event-panel .desc {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #222;
+}
+
+.centered-event-panel a {
+  font-size: 12px;
+  color: #2563eb;
+  text-decoration: none;
+}

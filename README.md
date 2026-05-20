@@ -1,14 +1,13 @@
 # papyrus
 
-Live-event map for San Francisco. FastAPI backend that fans out web search
-across Tavily, extracts structured events with Claude, and geocodes via
-Nominatim; React + Mapbox frontend renders them as markers.
+Live-event map for San Francisco. React + Mapbox frontend that renders a
+curated set of events as markers. A FastAPI backend (Tavily + Claude +
+Nominatim) is included for regenerating the static event list, but is not
+required to run the app.
 
 ## Running locally
 
-Prereqs: [uv](https://docs.astral.sh/uv/getting-started/installation/),
-Node 20+, [pnpm](https://pnpm.io/installation), and three API keys. uv will
-fetch the Python interpreter on first sync.
+Prereqs: Node 20+, [pnpm](https://pnpm.io/installation), and a Mapbox token.
 
 ### 1. Clone and set up env
 
@@ -20,21 +19,38 @@ cp .env.example .env
 
 Fill in `.env`:
 
-- `ANTHROPIC_API_KEY` — https://console.anthropic.com/settings/keys
-- `TAVILY_API_KEY` — https://tavily.com (free tier is fine)
 - `VITE_MAPBOX_TOKEN` — https://account.mapbox.com (default public token works)
 
-### 2. Backend (Python)
+### 2. Run the frontend
+
+```bash
+just dev
+```
+
+Open **http://localhost:5173/**. Events are loaded from
+`src/events.static.json`, so the first load is instant.
+
+## Optional: regenerating `events.static.json`
+
+The repo also ships a FastAPI backend that fans out web search across
+Tavily, extracts structured events with Claude, and geocodes via
+Nominatim. Use it when you want to refresh the static event list.
+
+Extra prereqs: [uv](https://docs.astral.sh/uv/getting-started/installation/),
+plus `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` in `.env`.
 
 ```bash
 uv sync
+just be   # serves http://127.0.0.1:8000
 ```
 
-### 3. Frontend (React + Vite)
+Health check:
 
 ```bash
-pnpm install
+curl 'http://127.0.0.1:8000/events?bbox=37.70,-122.52,37.83,-122.36&near=San+Francisco&limit=15'
 ```
+
+should return a JSON `{"events": [...]}` payload.
 
 ### Optional: auto-activate the Python venv with direnv
 
@@ -50,30 +66,3 @@ with `uv run`. A repo-tracked `.envrc` activates `.venv` on `cd` in.
    `.envrc` files automatically).
 
 Requires `.venv` to exist — run `uv sync` first.
-
-### 4. Run, in two terminals
-
-Terminal A — backend on `:8000`:
-
-```bash
-uv run uvicorn papyrus.api.main:app --host 127.0.0.1 --port 8000 --env-file .env --reload
-```
-
-(Or `just backend`.)
-
-Terminal B — frontend on `:5173`:
-
-```bash
-pnpm dev
-```
-
-Open **http://localhost:5173/**. First load is ~60s while the backend fans
-out to Tavily + Claude + Nominatim. Subsequent calls within the same minute
-hit an in-process cache and return instantly.
-
-### Health check
-
-```bash
-curl 'http://127.0.0.1:8000/events?bbox=37.70,-122.52,37.83,-122.36&near=San+Francisco&limit=15'
-```
-should return a JSON `{"events": [...]}` payload.

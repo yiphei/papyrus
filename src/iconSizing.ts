@@ -1,19 +1,22 @@
 // Per-pin icon sizing for the map's event symbol layer.
 //
 // The user-visible invariants this module enforces:
-//   1. No two icons ever overlap (anti-overlap solved as a small fixed-point
-//      relaxation across pairwise constraints, because magnification varies
-//      per pin).
+//   1. No two icons ever overlap (anti-overlap solved by a one-pass greedy
+//      sweep: pins are sorted by proximity to screen center; the center pin
+//      takes its full allowance first, later pins shrink to fit around
+//      already-sized neighbors). Deliberately asymmetric — see the
+//      computeSizes() comment for why fixed-point relaxation was rejected.
 //   2. Pins near the screen center magnify; pins farther away miniaturize.
 //      The falloff is a smoothstep across the viewport diagonal, so tiny
 //      pans don't perturb center pins.
 //   3. A lone visible pin scales to fill ~ABS_MAX_FRAC of the smaller
-//      viewport dimension, accomplished by ramping a negative `icon-offset`
-//      that lifts the artwork as it grows (visually equivalent to swapping
-//      icon-anchor from 'bottom' to 'center', but continuous — no jump).
+//      viewport dimension, accomplished by ramping the y component of
+//      `icon-offset` down (in screen coords) as the icon grows, which
+//      visually re-anchors the artwork from 'bottom' to 'center' without
+//      a discrete jump.
 //
-// All functions here are pure and unit-testable. The rAF loop in Map.tsx
-// calls computeSizes() once per frame during a gesture.
+// All functions here are pure and unit-testable. The rAF loop in
+// useIconSizingLoop calls computeSizes() once per frame during a gesture.
 
 import type { ThinnedPin } from './thinning'
 
@@ -102,12 +105,9 @@ export function offsetY(iconSize: number): number {
 //
 // For small icons the actual rendered lift is less than 0.5 (smoothstep ramp,
 // see offsetEase). Those icons may extend a few pixels above the viewport
-// top when their pin is near the top edge — the artwork artwork clips, the
-// stem (at the bottom of the sprite) stays visible at the coord. The
-// proximity factor already shrinks pins near edges, bounding the clipping.
-//
-// `ease` is kept in the signature for future use but is unused; the cap is
-// intentionally independent of the current lift.
+// top when their pin is near the top edge — the artwork clips, the stem
+// (at the bottom of the sprite) stays visible at the coord. The proximity
+// factor already shrinks pins near edges, bounding the clipping.
 //
 // Returns the cap as an iconSize value (not extent in pixels).
 export function positionCap(
@@ -115,7 +115,6 @@ export function positionCap(
   y: number,
   vw: number,
   vh: number,
-  _ease: number,
 ): number {
   const N = ICON_NATIVE_PX
   const verticalCap = (2 * Math.max(0, Math.min(y, vh - y))) / N
@@ -124,10 +123,12 @@ export function positionCap(
 }
 
 export interface SizingResult {
-  // Final icon-size to write to feature-state (already includes the
-  // proximity factor — read this verbatim into the Mapbox layer).
+  // Final icon-size to write to the feature's `iconSize` property (already
+  // includes the proximity factor — read this verbatim into the Mapbox
+  // layer's `icon-size`).
   iconSize: Float64Array
-  // y-component of icon-offset (icon-canvas px, negative). x is always 0.
+  // y-component of icon-offset in icon-canvas px (non-negative; positive-y
+  // is down in Mapbox screen coords). x is always 0.
   offsetY: Float64Array
 }
 
@@ -137,9 +138,13 @@ export interface SizingResult {
 // Algorithm:
 //   1. Project every thinned pin to screen pixels.
 //   2. Compute per-pin proximityFactor (independent).
-//   3. Fixed-point: each pin's allowed *base* size is the min of (positionCap,
-//      ABS_MAX, and the pairwise no-overlap cap given current neighbor sizes).
-//      Three iterations converge for the typical N (<= ~200).
+//   3. Greedy sweep in priority order: walk pins sorted by proximity factor
+//      descending. Each pin gets the largest base size that respects ABS_MAX,
+//      its positionCap, and the pairwise no-overlap constraint against
+//      already-sized neighbors. The center pin reaches max; later pins
+//      shrink. (Rejected alternative: symmetric fixed-point relaxation,
+//      which lets neighbors converge to balanced mid-sizes and never lets
+//      the center pin hit max.)
 //   4. Final iconSize = base × proximityFactor; offsetY computed from it.
 export function computeSizes(
   thinned: readonly ThinnedPin[],
@@ -168,7 +173,7 @@ export function computeSizes(
     p[i] = proximityFactor(x, y, vw, vh)
     // Position cap is symmetric across both axes (independent of the offset
     // ramp). See positionCap docstring for why.
-    posCap[i] = positionCap(x, y, vw, vh, 0)
+    posCap[i] = positionCap(x, y, vw, vh)
   }
 
   // Greedy sizing in priority order: pins closer to the screen center (higher

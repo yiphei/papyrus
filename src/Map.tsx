@@ -6,15 +6,14 @@ import MapGL, {
   type MapMouseEvent,
   type MapRef,
 } from 'react-map-gl/mapbox'
-import type { Map as MapboxMap } from 'mapbox-gl'
 import { useEvents } from './useEvents'
 import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
-import { rankEvents, thinByPixelSeparation, type ThinnedPin } from './thinning'
-import { computeSizes, ICON_NATIVE_PX } from './iconSizing'
+import { rankEvents, thinByPixelSeparation } from './thinning'
+import { ICON_NATIVE_PX } from './iconSizing'
+import { useIconSizingLoop, EVENTS_SOURCE_ID } from './useIconSizingLoop'
 
 const EVENTS_LAYER_ID = 'events-layer'
-const EVENTS_SOURCE_ID = 'events'
 
 // Radius of the "centered" hit region around the screen center, as a
 // fraction of the smaller viewport dimension. Generous on purpose: the
@@ -68,101 +67,6 @@ function iconIdFor(ev: LiveEvent): string {
   return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
-// One mutable GeoJSON FeatureCollection per source mount. The rAF loop mutates
-// per-pin `iconSize` and `offset` in place and pushes via setData each frame,
-// avoiding per-frame allocation churn. The FC is rebuilt only when the thinned
-// set changes (see useEffect that resets `fcRef.current`).
-type FeatureProps = {
-  id: string
-  iconId: string
-  count: number
-  iconSize: number
-  offset: [number, number]
-}
-type PinFeature = {
-  type: 'Feature'
-  id: number
-  geometry: { type: 'Point'; coordinates: [number, number] }
-  properties: FeatureProps
-}
-type PinFC = { type: 'FeatureCollection'; features: PinFeature[] }
-
-function buildFC(thinned: readonly ThinnedPin[]): PinFC {
-  return {
-    type: 'FeatureCollection',
-    features: thinned.map((pin, i) => ({
-      type: 'Feature',
-      id: i,
-      geometry: { type: 'Point', coordinates: [pin.event.lng, pin.event.lat] },
-      properties: {
-        id: pin.event.id,
-        iconId: iconIdFor(pin.event),
-        count: pin.count,
-        iconSize: 0,
-        offset: [0, 0],
-      },
-    })),
-  }
-}
-
-// Computes per-pin iconSize/offsetY for the current camera, mutates the
-// FeatureCollection in place, and pushes it to the source via setData.
-// Mapbox's symbol layer reads `iconSize` and `offset` from feature
-// properties via plain `['get', ...]` expressions. We call setData
-// imperatively (not via React state) so per-frame size updates don't go
-// through React's render cycle — that path was the original flicker source.
-//
-// Returns the event whose icon visual-center is closest to (cx, cy) within
-// CENTER_PROXIMITY × min(vw, vh), or null. Detection runs here (not as a
-// useMemo) because per-pin geometry is now mutated imperatively and React
-// no longer sees per-frame updates.
-function writeSizes(
-  map: MapboxMap,
-  thinned: readonly ThinnedPin[],
-  fc: PinFC,
-): LiveEvent | null {
-  const source = map.getSource(EVENTS_SOURCE_ID)
-  // Source may not be attached on the first frame after a thinning change.
-  // Skip until it's there; the rAF loop / sourcedata event will pick it up.
-  if (!source) return null
-  const canvas = map.getCanvas()
-  const vw = canvas.clientWidth
-  const vh = canvas.clientHeight
-  const project = (lng: number, lat: number) => {
-    const p = map.project([lng, lat])
-    return { x: p.x, y: p.y }
-  }
-  const { iconSize, offsetY } = computeSizes(thinned, project, vw, vh)
-  const cx = vw / 2
-  const cy = vh / 2
-  const threshold = Math.min(vw, vh) * CENTER_PROXIMITY
-  let centered: LiveEvent | null = null
-  let bestDist = threshold
-  for (let i = 0; i < thinned.length; i++) {
-    const props = fc.features[i].properties
-    props.iconSize = iconSize[i]
-    props.offset[1] = offsetY[i]
-    // Visual center of the rendered icon. icon-anchor='bottom' puts the
-    // sprite's bottom at the projected lng/lat; icon-offset (in icon-canvas
-    // px, multiplied by iconSize at render time) shifts it back down so a
-    // large icon ends up center-anchored at the coord. For a small icon
-    // (offsetY ≈ 0) the visual center sits half an icon-height above the
-    // tip; for a large one (offsetY ≈ ICON_NATIVE_PX/2) it lands on the tip.
-    const { x, y } = project(thinned[i].event.lng, thinned[i].event.lat)
-    const visualY = y + (offsetY[i] - ICON_NATIVE_PX / 2) * iconSize[i]
-    const dist = Math.hypot(x - cx, visualY - cy)
-    if (dist < bestDist) {
-      bestDist = dist
-      centered = thinned[i].event
-    }
-  }
-  // setData reparses the FC each call; for ~200 features this is well under
-  // a millisecond. mapbox-gl-js GeoJSONSource exposes setData via the
-  // returned Source instance.
-  ;(source as { setData(data: PinFC): void }).setData(fc)
-  return centered
-}
-
 export default function MapView() {
   const { events, loading, error } = useEvents()
   const [selected, setSelected] = useState<LiveEvent | null>(null)
@@ -172,18 +76,16 @@ export default function MapView() {
 
   // settledZoom advances only at moveEnd and drives thinning, so the visible
   // pin set stays stable mid-gesture (no pop-in/out during zoom). Per-pin
-  // sizing during a gesture is driven by an imperative rAF loop that writes
-  // map.setFeatureState — see the rAF useEffect below — so React no longer
-  // tracks zoom on the per-frame path. The `zoom` state below is only for
-  // the status badge and updates on moveEnd.
-  const [zoom, setZoom] = useState(12)
+  // sizing during a gesture lives in useIconSizingLoop — it runs an
+  // imperative rAF loop that pushes per-frame iconSize + icon-offset to
+  // Mapbox via setData, so React doesn't see per-frame size updates.
   const [settledZoom, setSettledZoom] = useState(12)
   // null = "all on"; a Set = explicit allowlist.
   const [activeCats, setActiveCats] = useState<Set<EventCategory> | null>(null)
-  // The event whose icon is currently near the screen center. Populated by
-  // the imperative rAF loop below (writeSizes computes it alongside sizing),
-  // and only changes when the *identity* of the centered event changes, so
-  // re-renders are kept to actual transitions, not every frame.
+  // The event whose icon is currently near the screen center. The effect
+  // below populates this from live per-pin sizes that useIconSizingLoop
+  // mutates into `geojson` each frame; updates fire only on identity
+  // changes, so this doesn't re-render every frame of a gesture.
   const [centeredEvent, setCenteredEvent] = useState<LiveEvent | null>(null)
 
   const countsByCategory = useMemo(() => {
@@ -202,68 +104,63 @@ export default function MapView() {
     () => thinByPixelSeparation(ranked, settledZoom),
     [ranked, settledZoom],
   )
-  // The React-controlled GeoJSON source is built once per thinning change
-  // with placeholder iconSize=0/offset=[0,0]. After mount, an imperative rAF
-  // loop owns the source — it mutates the same FC and calls setData() each
-  // frame to push fresh sizes. React-map-gl only pushes through setData when
-  // the data prop reference changes (i.e. when `thinned` changes), so our
-  // imperative writes are never clobbered mid-gesture.
-  const fcRef = useRef<PinFC | null>(null)
-  const geojson = useMemo(() => {
-    const fc = buildFC(thinned)
-    fcRef.current = fc
-    return fc
-  }, [thinned])
+  const map = mapLoaded ? (mapRef.current?.getMap() ?? null) : null
+  const { geojson } = useIconSizingLoop({
+    map,
+    thinned,
+    enabled: mapLoaded && iconsReady,
+    iconIdFor,
+  })
 
-  // Imperative rAF loop: computes per-pin iconSize + offsetY each frame during
-  // a gesture and mutates the FC, then pushes via setData. setData is the only
-  // way to update icon-size on a symbol layer (it's a layout property, so
-  // feature-state can't drive it). Calling setData directly from rAF avoids
-  // routing per-frame work through React's reconciliation, which was the
-  // original flicker source.
+  // Track which event's icon is currently near the screen center. Per-pin
+  // iconSize + offsetY are mutated each frame by useIconSizingLoop into the
+  // same `geojson` object we read here, so projecting against the live
+  // camera gives the rendered visual center. Mapbox's 'move' fires every
+  // animation frame during a gesture — that's our heartbeat — and we update
+  // React state only when the centered event's *identity* changes so this
+  // doesn't re-render 60×/sec.
   useEffect(() => {
-    if (!mapLoaded || !iconsReady) return
-    const map = mapRef.current?.getMap()
-    if (!map) return
-    if (thinned.length === 0) return
-    const fc = fcRef.current
-    if (!fc) return
-
-    // writeSizes returns the currently-centered event each frame; only
-    // commit it to React state when the identity actually changes, so this
-    // doesn't re-render 60×/sec during a gesture.
-    const updateCentered = (next: LiveEvent | null) => {
+    if (!mapLoaded || !iconsReady || !map) return
+    const detect = () => {
+      const canvas = map.getCanvas()
+      const vw = canvas.clientWidth
+      const vh = canvas.clientHeight
+      const cx = vw / 2
+      const cy = vh / 2
+      const threshold = Math.min(vw, vh) * CENTER_PROXIMITY
+      let centeredIdx = -1
+      let bestDist = threshold
+      for (let i = 0; i < thinned.length; i++) {
+        const props = geojson.features[i].properties
+        const { x, y } = map.project([
+          thinned[i].event.lng,
+          thinned[i].event.lat,
+        ])
+        // icon-anchor='bottom' puts the sprite's bottom at the projected
+        // lng/lat; icon-offset (icon-canvas px, multiplied by iconSize at
+        // render time) lifts it. Small icons sit bottom-anchored
+        // (offset ≈ 0) → visual center is half an icon-height above the
+        // tip; large icons lift to center-anchored
+        // (offset ≈ ICON_NATIVE_PX/2) → visual center lands on the tip.
+        const visualY =
+          y + (props.offset[1] - ICON_NATIVE_PX / 2) * props.iconSize
+        const dist = Math.hypot(x - cx, visualY - cy)
+        if (dist < bestDist) {
+          bestDist = dist
+          centeredIdx = i
+        }
+      }
+      const next = centeredIdx >= 0 ? thinned[centeredIdx].event : null
       setCenteredEvent((prev) => (prev?.id === next?.id ? prev : next))
     }
-
-    let rafId = 0
-    const tick = () => {
-      updateCentered(writeSizes(map, thinned, fc))
-      rafId = requestAnimationFrame(tick)
-    }
-    const startLoop = () => {
-      if (rafId === 0) rafId = requestAnimationFrame(tick)
-    }
-    const stopLoop = () => {
-      if (rafId !== 0) {
-        cancelAnimationFrame(rafId)
-        rafId = 0
-      }
-      updateCentered(writeSizes(map, thinned, fc))
-    }
-    const onResize = () => updateCentered(writeSizes(map, thinned, fc))
-
-    updateCentered(writeSizes(map, thinned, fc))
-    map.on('movestart', startLoop)
-    map.on('moveend', stopLoop)
-    map.on('resize', onResize)
+    detect()
+    map.on('move', detect)
+    map.on('resize', detect)
     return () => {
-      if (rafId !== 0) cancelAnimationFrame(rafId)
-      map.off('movestart', startLoop)
-      map.off('moveend', stopLoop)
-      map.off('resize', onResize)
+      map.off('move', detect)
+      map.off('resize', detect)
     }
-  }, [mapLoaded, iconsReady, thinned])
+  }, [mapLoaded, iconsReady, map, geojson, thinned])
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
   // zoom finds the icon already in the sprite, with no mid-gesture pop-in.
@@ -337,10 +234,7 @@ export default function MapView() {
         mapStyle="mapbox://styles/mapbox/streets-v12"
         interactiveLayerIds={[EVENTS_LAYER_ID]}
         onLoad={() => setMapLoaded(true)}
-        onMoveEnd={(e) => {
-          setZoom(e.viewState.zoom)
-          setSettledZoom(e.viewState.zoom)
-        }}
+        onMoveEnd={(e) => setSettledZoom(e.viewState.zoom)}
         onClick={handleClick}
         onMouseEnter={() => setCursor('pointer')}
         onMouseLeave={() => setCursor('')}
@@ -352,15 +246,23 @@ export default function MapView() {
               type="symbol"
               layout={{
                 'icon-image': ['get', 'iconId'],
-                // iconSize and offset are mutated per frame in fcRef.current's
-                // feature properties and pushed via source.setData() from the
-                // rAF loop. icon-size is a layout property and can't read
-                // feature-state, so plain ['get', ...] is required here.
+                // iconSize and offset are mutated per frame by useIconSizingLoop
+                // and pushed via source.setData(). icon-size is a layout
+                // property and can't read feature-state, so plain ['get', ...]
+                // is required.
                 'icon-size': ['get', 'iconSize'],
                 'icon-offset': ['get', 'offset'],
                 'icon-anchor': 'bottom',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,
+                // Larger icons render on top. The overlap solver in
+                // iconSizing.ts uses an inscribed-disk model (radius = half
+                // the icon's height), so square corners can still cross
+                // between neighbors. When that happens, the dominant icon
+                // (highest iconSize) should stay unoccluded by smaller
+                // ones. With icon-allow-overlap=true, a higher sort-key
+                // renders on top; per-frame iconSize updates re-evaluate it.
+                'symbol-sort-key': ['get', 'iconSize'],
                 // Count badge rendered as same-layer text. text-halo gives the
                 // blue pill effect; empty string when count == 1 suppresses it.
                 'text-field': [
@@ -404,7 +306,7 @@ export default function MapView() {
         error={error}
         count={events.length}
         shown={thinned.length}
-        zoom={zoom}
+        zoom={settledZoom}
       />
 
       <CategoryFilter

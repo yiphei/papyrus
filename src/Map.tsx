@@ -19,6 +19,17 @@ const EVENTS_LAYER_ID = 'events-layer'
 // viewport dimension.
 const PROXIMITY_MIN_FACTOR = 0.4
 
+// Radius of the "centered" hit region around the screen center, as a
+// fraction of the smaller viewport dimension. Generous on purpose: the
+// user shouldn't need to land a pin precisely at (cx, cy) — they just
+// need to roughly center it.
+const CENTER_PROXIMITY = 0.12
+
+// Native icon footprint in pixels (matches sizeByNearestNeighbor's
+// iconNativePx default). Half of this is the icon's vertical extent
+// above the anchor point when iconSize == 1.
+const ICON_NATIVE_PX = 110
+
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
   concert: '🎵',
   sports: '🏟️',
@@ -154,6 +165,35 @@ export default function MapView() {
     }),
     [pins],
   )
+
+  // Pin closest to the screen center, if any pin's visual center lies within
+  // CENTER_PROXIMITY × min(vw, vh) of (cx, cy). icon-anchor is 'bottom', so
+  // the projected lng/lat sits at the icon's tip; the visual center is half
+  // the (scaled) icon height above that. Using the visual center makes the
+  // panel trigger feel right — the user aligns the big icon body, not the
+  // invisible tip below it.
+  const centeredEvent = useMemo<LiveEvent | null>(() => {
+    const map = mapRef.current?.getMap()
+    if (!map || pins.length === 0) return null
+    const canvas = map.getCanvas()
+    const vw = canvas.clientWidth
+    const vh = canvas.clientHeight
+    const cx = vw / 2
+    const cy = vh / 2
+    const threshold = Math.min(vw, vh) * CENTER_PROXIMITY
+    let best: LiveEvent | null = null
+    let bestDist = threshold
+    for (const pin of pins) {
+      const { x, y } = map.project([pin.event.lng, pin.event.lat])
+      const visualY = y - (ICON_NATIVE_PX / 2) * pin.iconSize
+      const dist = Math.hypot(x - cx, visualY - cy)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = pin.event
+      }
+    }
+    return best
+  }, [pins, mapLoaded])
 
   useEffect(() => {
     if (!mapLoaded) return
@@ -318,6 +358,12 @@ export default function MapView() {
         onToggle={toggleCategory}
         onReset={() => setActiveCats(null)}
       />
+
+      {centeredEvent && (
+        <div className="event-side-panel" role="complementary">
+          <EventDetails ev={centeredEvent} />
+        </div>
+      )}
     </div>
   )
 }
@@ -363,7 +409,7 @@ function CategoryFilter({
   )
 }
 
-function EventPopupBody({ ev }: { ev: LiveEvent }) {
+function EventDetails({ ev }: { ev: LiveEvent }) {
   const when = ev.starts_at
     ? new Date(ev.starts_at).toLocaleString(undefined, {
         weekday: 'short',
@@ -374,7 +420,7 @@ function EventPopupBody({ ev }: { ev: LiveEvent }) {
       })
     : null
   return (
-    <div className="event-popup">
+    <>
       <h3>{ev.title}</h3>
       {when && <p className="meta">{when}</p>}
       {ev.venue_name && <p className="meta">{ev.venue_name}</p>}
@@ -387,6 +433,14 @@ function EventPopupBody({ ev }: { ev: LiveEvent }) {
           </a>
         </p>
       )}
+    </>
+  )
+}
+
+function EventPopupBody({ ev }: { ev: LiveEvent }) {
+  return (
+    <div className="event-popup">
+      <EventDetails ev={ev} />
     </div>
   )
 }

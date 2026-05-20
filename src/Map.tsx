@@ -53,8 +53,8 @@ const CATEGORY_LABEL: Record<EventCategory, string> = {
   other: 'Other',
 }
 
-// Display order for the filter bar. Categories with zero events in the
-// current fetch are hidden, so this list can stay long without crowding.
+// Display order for the filter bar. Categories with zero events are
+// hidden, so this list can stay long without crowding.
 const CATEGORY_ORDER: EventCategory[] = [
   'concert', 'sports', 'theater', 'comedy', 'film',
   'farmers_market', 'festival', 'fair', 'exhibition',
@@ -90,9 +90,7 @@ export default function MapView() {
   // Bumped only on window/canvas resize so the viewport-derived size cap
   // recomputes when the user resizes the window.
   const [viewportTick, setViewportTick] = useState(0)
-  // null = "all on"; a Set = explicit allowlist. Filtering is client-side
-  // because the backend caches the full inventory and toggling on the
-  // server would force a refetch on every click.
+  // null = "all on"; a Set = explicit allowlist.
   const [activeCats, setActiveCats] = useState<Set<EventCategory> | null>(null)
 
   const countsByCategory = useMemo(() => {
@@ -169,7 +167,7 @@ export default function MapView() {
   }, [mapLoaded])
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
-  // zoom never has to wait on a fetch — the icons are already in the sprite.
+  // zoom finds the icon already in the sprite, with no mid-gesture pop-in.
   useEffect(() => {
     if (!mapLoaded) return
     const map = mapRef.current?.getMap()

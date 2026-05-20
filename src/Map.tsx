@@ -11,7 +11,6 @@ import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
 
-const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
 const EVENTS_LAYER_ID = 'events-layer'
 
 // Proximity-to-center magnification: a pin at the map center renders at its
@@ -67,20 +66,7 @@ function iconIdFor(ev: LiveEvent): string {
 }
 
 export default function MapView() {
-  const params = useMemo(() => {
-    const now = new Date()
-    now.setSeconds(0, 0)
-    const in2Days = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000)
-    return {
-      bbox: SF_BBOX,
-      near: 'San Francisco',
-      startsAfter: now,
-      startsBefore: in2Days,
-      limit: 200,
-    }
-  }, [])
-
-  const { events, loading, error } = useEvents(params)
+  const { events, loading, error } = useEvents()
   const [selected, setSelected] = useState<LiveEvent | null>(null)
   const [iconsReady, setIconsReady] = useState(false)
   const [mapLoaded, setMapLoaded] = useState(false)

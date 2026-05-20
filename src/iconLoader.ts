@@ -6,12 +6,20 @@ const PIXEL_RATIO = 2
 // symbol layer upscales it at deep zoom (icon-size goes up to ~3x).
 const ASSET_PIXEL_RATIO = 6
 
+// Bottom strip reserved for the location stem + tip dot. Large illustrated
+// artwork makes the coord (icon-anchor='bottom') visually ambiguous — the
+// stem anchors the eye to a precise point on the map.
+const STEM_HEIGHT_CSS = 18
+const STEM_COLOR = '#2563eb'
+
 export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): Promise<void> {
   if (map.hasImage(id)) return
   const img = await loadImage(url)
 
   const cssSize = 110
   const size = cssSize * ASSET_PIXEL_RATIO
+  const stemPx = STEM_HEIGHT_CSS * ASSET_PIXEL_RATIO
+  const fitH = size - stemPx
 
   const canvas = document.createElement('canvas')
   canvas.width = size
@@ -19,17 +27,18 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('2D canvas context unavailable')
 
-  // Letterbox-fill with white so non-square sources keep their aspect ratio
-  // and the padded area is uniform with the source's near-white background,
-  // letting the flood-fill key it all out in one pass.
+  // White-fill only the fit area; the stem strip stays transparent so the
+  // stem can be painted onto it after the artwork is keyed.
   ctx.fillStyle = '#ffffff'
-  ctx.fillRect(0, 0, size, size)
+  ctx.fillRect(0, 0, size, fitH)
 
-  const scale = Math.min(size / img.width, size / img.height)
+  // Bottom-align the artwork inside the fit area so its base sits flush
+  // against the stem, regardless of source aspect ratio.
+  const scale = Math.min(size / img.width, fitH / img.height)
   const drawW = img.width * scale
   const drawH = img.height * scale
   const drawX = (size - drawW) / 2
-  const drawY = (size - drawH) / 2
+  const drawY = fitH - drawH
 
   ctx.imageSmoothingEnabled = true
   ctx.imageSmoothingQuality = 'high'
@@ -38,8 +47,53 @@ export async function ensureAssetIcon(map: MapboxMap, id: string, url: string): 
   const data = ctx.getImageData(0, 0, size, size)
   keyOutBackground(data, sampleBackgroundThreshold(img))
 
+  // The stem has a near-white outline that flood-fill would key out, so it
+  // has to be painted *after* keying. Restore the keyed pixels, then draw.
+  ctx.clearRect(0, 0, size, size)
+  ctx.putImageData(data, 0, 0)
+  drawLocationStem(ctx, size, fitH, ASSET_PIXEL_RATIO)
+
+  const finalData = ctx.getImageData(0, 0, size, size)
   if (map.hasImage(id)) map.removeImage(id)
-  map.addImage(id, data, { pixelRatio: ASSET_PIXEL_RATIO })
+  map.addImage(id, finalData, { pixelRatio: ASSET_PIXEL_RATIO })
+}
+
+function drawLocationStem(
+  ctx: CanvasRenderingContext2D,
+  size: number,
+  stemTop: number,
+  pr: number,
+): void {
+  const x = size / 2
+  const dotR = 3.5 * pr
+  // Dot's bottom touches the canvas bottom row, which is where
+  // icon-anchor='bottom' lands the coord.
+  const dotCy = size - dotR
+
+  ctx.lineCap = 'round'
+
+  // White underlay so the stem stays legible against dark map terrain.
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)'
+  ctx.lineWidth = 5 * pr
+  ctx.beginPath()
+  ctx.moveTo(x, stemTop)
+  ctx.lineTo(x, dotCy)
+  ctx.stroke()
+
+  ctx.strokeStyle = STEM_COLOR
+  ctx.lineWidth = 2 * pr
+  ctx.beginPath()
+  ctx.moveTo(x, stemTop)
+  ctx.lineTo(x, dotCy)
+  ctx.stroke()
+
+  ctx.fillStyle = STEM_COLOR
+  ctx.strokeStyle = '#ffffff'
+  ctx.lineWidth = 1.5 * pr
+  ctx.beginPath()
+  ctx.arc(x, dotCy, dotR, 0, Math.PI * 2)
+  ctx.fill()
+  ctx.stroke()
 }
 
 // Pick a flood-fill threshold based on the source's actual corner brightness

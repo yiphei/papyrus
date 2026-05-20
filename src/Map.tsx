@@ -9,8 +9,10 @@ import MapGL, {
 import { useEvents } from './useEvents'
 import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
-import { rankEvents, thinByPixelSeparation } from './thinning'
+import { rankEvents, thinByPixelSeparation, type ThinnedPin } from './thinning'
+import { findCenteredIndex } from './iconSizing'
 import { useIconSizingLoop, EVENTS_SOURCE_ID } from './useIconSizingLoop'
+import type { Map as MapboxMap } from 'mapbox-gl'
 
 const EVENTS_LAYER_ID = 'events-layer'
 
@@ -63,9 +65,14 @@ function iconIdFor(ev: LiveEvent): string {
 export default function MapView() {
   const { events, loading, error } = useEvents()
   const [selected, setSelected] = useState<LiveEvent | null>(null)
+  const [centered, setCentered] = useState<LiveEvent | null>(null)
   const [iconsReady, setIconsReady] = useState(false)
   const [mapLoaded, setMapLoaded] = useState(false)
   const mapRef = useRef<MapRef>(null)
+  // Last centered event id pushed to React state. Lets the rAF tick decide
+  // whether anything actually changed, so per-frame center detection only
+  // hits setState when the pin under the center reticle flips.
+  const centeredIdRef = useRef<string | null>(null)
 
   // settledZoom advances only at moveEnd and drives thinning, so the visible
   // pin set stays stable mid-gesture (no pop-in/out during zoom). Per-pin
@@ -93,11 +100,48 @@ export default function MapView() {
     [ranked, settledZoom],
   )
   const map = mapLoaded ? (mapRef.current?.getMap() ?? null) : null
+
+  // Per-frame center detection piggybacks on the sizing rAF: same listeners,
+  // same tick, projections happen once per pin per frame. The id-guarded ref
+  // means setState only fires when the pin under the center reticle flips —
+  // gestures that don't change the centered pin (or have none) cost zero
+  // React work.
+  const syncCentered = (m: MapboxMap, thinnedNow: readonly ThinnedPin[]) => {
+    const canvas = m.getCanvas()
+    const vw = canvas.clientWidth
+    const vh = canvas.clientHeight
+    const idx = findCenteredIndex(
+      thinnedNow,
+      (lng, lat) => {
+        const p = m.project([lng, lat])
+        return { x: p.x, y: p.y }
+      },
+      vw,
+      vh,
+    )
+    const ev = idx >= 0 ? thinnedNow[idx].event : null
+    const newId = ev?.id ?? null
+    if (newId !== centeredIdRef.current) {
+      centeredIdRef.current = newId
+      setCentered(ev)
+    }
+  }
+
+  // Empty thinned set short-circuits useIconSizingLoop, so the hook's
+  // onFrame won't fire — clear any stale centered state here.
+  useEffect(() => {
+    if (thinned.length === 0 && centeredIdRef.current !== null) {
+      centeredIdRef.current = null
+      setCentered(null)
+    }
+  }, [thinned])
+
   const { geojson } = useIconSizingLoop({
     map,
     thinned,
     enabled: mapLoaded && iconsReady,
     iconIdFor,
+    onFrame: syncCentered,
   })
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
@@ -253,6 +297,36 @@ export default function MapView() {
         onToggle={toggleCategory}
         onReset={() => setActiveCats(null)}
       />
+
+      {centered && <CenteredEventPanel ev={centered} />}
+    </div>
+  )
+}
+
+function CenteredEventPanel({ ev }: { ev: LiveEvent }) {
+  const when = ev.starts_at
+    ? new Date(ev.starts_at).toLocaleString(undefined, {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      })
+    : null
+  return (
+    <div className="centered-event-panel" role="region" aria-label="Event details">
+      <h3>{ev.title}</h3>
+      {when && <p className="meta">{when}</p>}
+      {ev.venue_name && <p className="meta">{ev.venue_name}</p>}
+      {ev.address && <p className="meta">{ev.address}</p>}
+      {ev.description && <p className="desc">{ev.description}</p>}
+      {ev.url && (
+        <p>
+          <a href={ev.url} target="_blank" rel="noreferrer">
+            More info ↗
+          </a>
+        </p>
+      )}
     </div>
   )
 }

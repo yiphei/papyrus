@@ -60,6 +60,12 @@ export const MIN_SIZE = 20 / ICON_NATIVE_PX
 // docs/icon-magnification.md §7.
 export const CROSSOVER_BLEND_PX = 80
 
+// Radius (as a fraction of min(vw, vh)) around the viewport center that
+// counts as "the icon is centered" for the on-hover description panel. Wide
+// enough that the user doesn't have to land on (0,0) — small enough that
+// only one pin at a time qualifies in practice.
+export const CENTER_HOLD_FRAC = 0.15
+
 function clamp01(x: number): number {
   if (x < 0) return 0
   if (x > 1) return 1
@@ -238,4 +244,36 @@ export function computeSizes(
     out.offsetY[i] = offsetY(rendered)
   }
   return out
+}
+
+// Returns the index of the thinned pin whose projected position is closest
+// to the viewport center, or -1 if no pin is within CENTER_HOLD_FRAC ×
+// min(vw, vh) of center. The radius is the "reasonable surface area" that
+// keeps the description panel sticky against small pans.
+export function findCenteredIndex(
+  thinned: readonly ThinnedPin[],
+  project: (lng: number, lat: number) => { x: number; y: number },
+  vw: number,
+  vh: number,
+): number {
+  if (thinned.length === 0) return -1
+  const cx = vw / 2
+  const cy = vh / 2
+  const radius = CENTER_HOLD_FRAC * Math.min(vw, vh)
+  const radiusSq = radius * radius
+  let bestIdx = -1
+  let bestDsq = Number.POSITIVE_INFINITY
+  for (let i = 0; i < thinned.length; i++) {
+    const { event } = thinned[i]
+    const { x, y } = project(event.lng, event.lat)
+    const dx = x - cx
+    const dy = y - cy
+    const dsq = dx * dx + dy * dy
+    if (dsq < bestDsq) {
+      bestDsq = dsq
+      bestIdx = i
+    }
+  }
+  if (bestIdx === -1 || bestDsq > radiusSq) return -1
+  return bestIdx
 }

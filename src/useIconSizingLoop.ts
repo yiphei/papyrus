@@ -85,11 +85,17 @@ export function useIconSizingLoop({
   thinned,
   enabled,
   iconIdFor,
+  onFrame,
 }: {
   map: MapboxMap | null
   thinned: readonly ThinnedPin[]
   enabled: boolean
   iconIdFor: (ev: LiveEvent) => string
+  // Optional per-frame hook for callers that want to piggyback on the same
+  // rAF and gesture-event subscription (e.g. detecting which pin sits at
+  // the screen center). Runs after writeSizes so map.project reflects the
+  // current frame.
+  onFrame?: (map: MapboxMap, thinned: readonly ThinnedPin[]) => void
 }): { geojson: PinFC } {
   // The same FC reference is handed to React-map-gl's <Source> and mutated
   // in place by the rAF loop. It rebuilds only when `thinned` changes, so
@@ -104,13 +110,24 @@ export function useIconSizingLoop({
     fcRef.current = geojson
   }, [geojson])
 
+  // Stash onFrame in a ref so a new inline callback on each render doesn't
+  // re-subscribe the gesture listeners (which would leak handlers).
+  const onFrameRef = useRef(onFrame)
+  useEffect(() => {
+    onFrameRef.current = onFrame
+  }, [onFrame])
+
   useEffect(() => {
     if (!enabled || !map || thinned.length === 0) return
     const fc = fcRef.current
 
+    const runFrame = () => {
+      writeSizes(map, thinned, fc)
+      onFrameRef.current?.(map, thinned)
+    }
     let rafId = 0
     const tick = () => {
-      writeSizes(map, thinned, fc)
+      runFrame()
       rafId = requestAnimationFrame(tick)
     }
     const startLoop = () => {
@@ -121,11 +138,11 @@ export function useIconSizingLoop({
         cancelAnimationFrame(rafId)
         rafId = 0
       }
-      writeSizes(map, thinned, fc)
+      runFrame()
     }
-    const onResize = () => writeSizes(map, thinned, fc)
+    const onResize = () => runFrame()
 
-    writeSizes(map, thinned, fc)
+    runFrame()
     map.on('movestart', startLoop)
     map.on('moveend', stopLoop)
     map.on('resize', onResize)

@@ -7,22 +7,18 @@ import MapGL, {
   type MapRef,
 } from 'react-map-gl/mapbox'
 import { useEvents } from './useEvents'
-import { ensureEmojiIcon } from './iconLoader'
+import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
 import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
 
 const SF_BBOX: [number, number, number, number] = [37.7, -122.52, 37.83, -122.36]
 const EVENTS_LAYER_ID = 'events-layer'
 
-// CSS-pixel size of the emoji icon bitmap at icon-size=1. Drives the
-// nearest-neighbor sizing math so iconSize multipliers translate into
-// real on-screen pixels.
-const EMOJI_ICON_PX = 36
-// Floor: icons never render smaller than this multiple of native size, so
-// dense clusters stay readable instead of collapsing to a dot.
-const EMOJI_MIN_ICON_SIZE = 1.0
-// Ceiling: lone pins at deep zoom don't blow past this multiple of native.
-const EMOJI_MAX_ICON_SIZE = 1.5
+// Proximity-to-center magnification: a pin at the map center renders at its
+// full nearest-neighbor size; a pin at the viewport edge shrinks to this
+// fraction of it. Linear falloff between, normalized to half the smaller
+// viewport dimension.
+const PROXIMITY_MIN_FACTOR = 0.4
 
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
   concert: '🎵',
@@ -67,7 +63,7 @@ const CATEGORY_ORDER: EventCategory[] = [
 ]
 
 function iconIdFor(ev: LiveEvent): string {
-  return `event-emoji-${ev.category}`
+  return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
 export default function MapView() {
@@ -99,10 +95,15 @@ export default function MapView() {
   //     (the zoom value is identical, so no re-render).
   const [zoom, setZoom] = useState(12)
   const [settledZoom, setSettledZoom] = useState(12)
-  // Setters retained for the move/resize listeners; values currently unused
-  // while the per-pin position cap and proximity magnification are disabled.
-  const [, setMoveTick] = useState(0)
-  const [, setViewportTick] = useState(0)
+  // Bumped on every map move (pan, zoom, rotate) so the per-pin screen-
+  // position cap recomputes. Pan alone leaves `zoom` unchanged, but
+  // map.project(lngLat) shifts with the center, so without this signal a
+  // pin that was off-screen at zoom-time stays clamped to iconSize=0 even
+  // after it pans into view.
+  const [moveTick, setMoveTick] = useState(0)
+  // Bumped only on window/canvas resize so the viewport-derived size cap
+  // recomputes when the user resizes the window.
+  const [viewportTick, setViewportTick] = useState(0)
   // null = "all on"; a Set = explicit allowlist. Filtering is client-side
   // because the backend caches the full inventory and toggling on the
   // server would force a refetch on every click.
@@ -124,17 +125,39 @@ export default function MapView() {
     () => thinByPixelSeparation(ranked, settledZoom),
     [ranked, settledZoom],
   )
-  // Sizing: each pin grows to fill the gap to its nearest neighbor.
-  // iconNativePx must match the emoji-icon canvas (36 css px) — the default
-  // 110 was calibrated for the now-removed asset icons and shrank emoji
-  // pins to ~6 css px even at the minSize floor.
+  // Sizing has two clamps stacked:
+  //   1. sizeByNearestNeighbor caps each pin by half its nearest-neighbor
+  //      distance (no inter-pin collision).
+  //   2. A per-pin screen-position cap: with icon-anchor='bottom' the icon
+  //      extends upward by iconSize*110 from the pin, so available upward
+  //      space is `y` to the top of the viewport; horizontally it's
+  //      centered, so available is `2 × min(x, vw - x)`. The smaller of
+  //      the two divided by 110 is the position cap. This is what stops a
+  //      lone-visible pin at deep zoom from blowing past the viewport.
   const pins = useMemo(() => {
-    return sizeByNearestNeighbor(thinned, zoom, {
-      iconNativePx: EMOJI_ICON_PX,
-      minSize: EMOJI_MIN_ICON_SIZE,
-      maxSize: EMOJI_MAX_ICON_SIZE,
+    const map = mapRef.current?.getMap()
+    if (!map) return sizeByNearestNeighbor(thinned, zoom)
+    const canvas = map.getCanvas()
+    const vw = canvas.clientWidth
+    const vh = canvas.clientHeight
+    const sized = sizeByNearestNeighbor(thinned, zoom, {
+      maxSize: Math.min(vw, vh) / 110,
     })
-  }, [thinned, zoom])
+    const cx = vw / 2
+    const cy = vh / 2
+    const halfMin = Math.min(vw, vh) / 2
+    return sized.map((pin) => {
+      const { x, y } = map.project([pin.event.lng, pin.event.lat])
+      const verticalCap = Math.max(0, y) / 110
+      const horizontalCap = (2 * Math.max(0, Math.min(x, vw - x))) / 110
+      const positionCap = Math.min(verticalCap, horizontalCap)
+      const distNorm =
+        halfMin > 0 ? Math.min(1, Math.hypot(x - cx, y - cy) / halfMin) : 0
+      const proximityFactor = 1 - (1 - PROXIMITY_MIN_FACTOR) * distNorm
+      const iconSize = Math.min(pin.iconSize, positionCap) * proximityFactor
+      return { ...pin, iconSize }
+    })
+  }, [thinned, zoom, mapLoaded, viewportTick, moveTick])
 
   const geojson = useMemo(
     () => ({
@@ -159,39 +182,32 @@ export default function MapView() {
     }
   }, [mapLoaded])
 
-  // Register every category's emoji bitmap once at map-load time. Doing this
-  // up-front (rather than per-event after fetch) closes a render-order race:
-  // the symbol layer's geojson recomputes synchronously during render with
-  // iconIds for the new events, but a per-event useEffect only runs after
-  // paint, so mapbox would log "Image ... could not be loaded" and silently
-  // drop those pins. With 14 categories the upfront cost is trivial.
-  // A `styleimagemissing` handler is kept as a fallback for any iconId that
-  // ever slips through (e.g. a future non-category icon scheme).
+  // Register an icon per event (not per visible pin) so re-thinning at higher
+  // zoom never has to wait on a fetch — the icons are already in the sprite.
   useEffect(() => {
     if (!mapLoaded) return
     const map = mapRef.current?.getMap()
-    if (!map) return
+    if (!map || events.length === 0) return
+    let cancelled = false
 
-    for (const cat of CATEGORY_ORDER) {
-      const id = `event-emoji-${cat}`
-      if (!map.hasImage(id)) ensureEmojiIcon(map, id, CATEGORY_EMOJI[cat])
-    }
-    setIconsReady(true)
+    setIconsReady(false)
+    Promise.all(
+      events.map(async (ev) => {
+        const id = iconIdFor(ev)
+        if (map.hasImage(id)) return
+        if (ev.image_url) await ensureAssetIcon(map, id, ev.image_url)
+        else ensureEmojiIcon(map, id, CATEGORY_EMOJI[ev.category])
+      }),
+    )
+      .then(() => {
+        if (!cancelled) setIconsReady(true)
+      })
+      .catch((e) => console.error('Failed to load event icons', e))
 
-    const onMissing = (e: { id: string }) => {
-      const id = e.id
-      if (map.hasImage(id)) return
-      const match = /^event-emoji-(.+)$/.exec(id)
-      if (!match) return
-      const cat = match[1] as EventCategory
-      const emoji = CATEGORY_EMOJI[cat]
-      if (emoji) ensureEmojiIcon(map, id, emoji)
-    }
-    map.on('styleimagemissing', onMissing)
     return () => {
-      map.off('styleimagemissing', onMissing)
+      cancelled = true
     }
-  }, [mapLoaded])
+  }, [mapLoaded, events])
 
   const handleClick = (e: MapMouseEvent) => {
     const feature = e.features?.[0]

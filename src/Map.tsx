@@ -6,18 +6,15 @@ import MapGL, {
   type MapMouseEvent,
   type MapRef,
 } from 'react-map-gl/mapbox'
+import type { Map as MapboxMap } from 'mapbox-gl'
 import { useEvents } from './useEvents'
 import { ensureAssetIcon, ensureEmojiIcon } from './iconLoader'
 import type { EventCategory, LiveEvent } from './api'
-import { rankEvents, sizeByNearestNeighbor, thinByPixelSeparation } from './thinning'
+import { rankEvents, thinByPixelSeparation, type ThinnedPin } from './thinning'
+import { computeSizes } from './iconSizing'
 
 const EVENTS_LAYER_ID = 'events-layer'
-
-// Proximity-to-center magnification: a pin at the map center renders at its
-// full nearest-neighbor size; a pin at the viewport edge shrinks to this
-// fraction of it. Linear falloff between, normalized to half the smaller
-// viewport dimension.
-const PROXIMITY_MIN_FACTOR = 0.4
+const EVENTS_SOURCE_ID = 'events'
 
 const CATEGORY_EMOJI: Record<EventCategory, string> = {
   concert: '🎵',
@@ -65,6 +62,77 @@ function iconIdFor(ev: LiveEvent): string {
   return ev.image_url ? `event-asset-${ev.id}` : `event-emoji-${ev.category}`
 }
 
+// One mutable GeoJSON FeatureCollection per source mount. The rAF loop mutates
+// per-pin `iconSize` and `offset` in place and pushes via setData each frame,
+// avoiding per-frame allocation churn. The FC is rebuilt only when the thinned
+// set changes (see useEffect that resets `fcRef.current`).
+type FeatureProps = {
+  id: string
+  iconId: string
+  count: number
+  iconSize: number
+  offset: [number, number]
+}
+type PinFeature = {
+  type: 'Feature'
+  id: number
+  geometry: { type: 'Point'; coordinates: [number, number] }
+  properties: FeatureProps
+}
+type PinFC = { type: 'FeatureCollection'; features: PinFeature[] }
+
+function buildFC(thinned: readonly ThinnedPin[]): PinFC {
+  return {
+    type: 'FeatureCollection',
+    features: thinned.map((pin, i) => ({
+      type: 'Feature',
+      id: i,
+      geometry: { type: 'Point', coordinates: [pin.event.lng, pin.event.lat] },
+      properties: {
+        id: pin.event.id,
+        iconId: iconIdFor(pin.event),
+        count: pin.count,
+        iconSize: 0,
+        offset: [0, 0],
+      },
+    })),
+  }
+}
+
+// Computes per-pin iconSize/offsetY for the current camera, mutates the
+// FeatureCollection in place, and pushes it to the source via setData.
+// Mapbox's symbol layer reads `iconSize` and `offset` from feature
+// properties via plain `['get', ...]` expressions. We call setData
+// imperatively (not via React state) so per-frame size updates don't go
+// through React's render cycle — that path was the original flicker source.
+function writeSizes(
+  map: MapboxMap,
+  thinned: readonly ThinnedPin[],
+  fc: PinFC,
+): void {
+  const source = map.getSource(EVENTS_SOURCE_ID)
+  // Source may not be attached on the first frame after a thinning change.
+  // Skip until it's there; the rAF loop / sourcedata event will pick it up.
+  if (!source) return
+  const canvas = map.getCanvas()
+  const vw = canvas.clientWidth
+  const vh = canvas.clientHeight
+  const project = (lng: number, lat: number) => {
+    const p = map.project([lng, lat])
+    return { x: p.x, y: p.y }
+  }
+  const { iconSize, offsetY } = computeSizes(thinned, project, vw, vh)
+  for (let i = 0; i < thinned.length; i++) {
+    const props = fc.features[i].properties
+    props.iconSize = iconSize[i]
+    props.offset[1] = offsetY[i]
+  }
+  // setData reparses the FC each call; for ~200 features this is well under
+  // a millisecond. mapbox-gl-js GeoJSONSource exposes setData via the
+  // returned Source instance.
+  ;(source as { setData(data: PinFC): void }).setData(fc)
+}
+
 export default function MapView() {
   const { events, loading, error } = useEvents()
   const [selected, setSelected] = useState<LiveEvent | null>(null)
@@ -72,24 +140,14 @@ export default function MapView() {
   const [mapLoaded, setMapLoaded] = useState(false)
   const mapRef = useRef<MapRef>(null)
 
-  // Two zoom signals on purpose:
-  //   - settledZoom advances only at moveEnd and drives thinning, so the
-  //     visible pin set stays stable mid-gesture (no pop-in/out during zoom).
-  //   - zoom advances on every move frame and drives per-pin sizing, so
-  //     icons scale continuously with the gesture rather than snapping at
-  //     moveEnd. Pan frames are filtered out by React's setState bail-out
-  //     (the zoom value is identical, so no re-render).
+  // settledZoom advances only at moveEnd and drives thinning, so the visible
+  // pin set stays stable mid-gesture (no pop-in/out during zoom). Per-pin
+  // sizing during a gesture is driven by an imperative rAF loop that writes
+  // map.setFeatureState — see the rAF useEffect below — so React no longer
+  // tracks zoom on the per-frame path. The `zoom` state below is only for
+  // the status badge and updates on moveEnd.
   const [zoom, setZoom] = useState(12)
   const [settledZoom, setSettledZoom] = useState(12)
-  // Bumped on every map move (pan, zoom, rotate) so the per-pin screen-
-  // position cap recomputes. Pan alone leaves `zoom` unchanged, but
-  // map.project(lngLat) shifts with the center, so without this signal a
-  // pin that was off-screen at zoom-time stays clamped to iconSize=0 even
-  // after it pans into view.
-  const [moveTick, setMoveTick] = useState(0)
-  // Bumped only on window/canvas resize so the viewport-derived size cap
-  // recomputes when the user resizes the window.
-  const [viewportTick, setViewportTick] = useState(0)
   // null = "all on"; a Set = explicit allowlist.
   const [activeCats, setActiveCats] = useState<Set<EventCategory> | null>(null)
 
@@ -109,62 +167,61 @@ export default function MapView() {
     () => thinByPixelSeparation(ranked, settledZoom),
     [ranked, settledZoom],
   )
-  // Sizing has two clamps stacked:
-  //   1. sizeByNearestNeighbor caps each pin by half its nearest-neighbor
-  //      distance (no inter-pin collision).
-  //   2. A per-pin screen-position cap: with icon-anchor='bottom' the icon
-  //      extends upward by iconSize*110 from the pin, so available upward
-  //      space is `y` to the top of the viewport; horizontally it's
-  //      centered, so available is `2 × min(x, vw - x)`. The smaller of
-  //      the two divided by 110 is the position cap. This is what stops a
-  //      lone-visible pin at deep zoom from blowing past the viewport.
-  const pins = useMemo(() => {
-    const map = mapRef.current?.getMap()
-    if (!map) return sizeByNearestNeighbor(thinned, zoom)
-    const canvas = map.getCanvas()
-    const vw = canvas.clientWidth
-    const vh = canvas.clientHeight
-    const sized = sizeByNearestNeighbor(thinned, zoom, {
-      maxSize: Math.min(vw, vh) / 110,
-    })
-    const cx = vw / 2
-    const cy = vh / 2
-    const halfMin = Math.min(vw, vh) / 2
-    return sized.map((pin) => {
-      const { x, y } = map.project([pin.event.lng, pin.event.lat])
-      const verticalCap = Math.max(0, y) / 110
-      const horizontalCap = (2 * Math.max(0, Math.min(x, vw - x))) / 110
-      const positionCap = Math.min(verticalCap, horizontalCap)
-      const distNorm =
-        halfMin > 0 ? Math.min(1, Math.hypot(x - cx, y - cy) / halfMin) : 0
-      const proximityFactor = 1 - (1 - PROXIMITY_MIN_FACTOR) * distNorm
-      const iconSize = Math.min(pin.iconSize, positionCap) * proximityFactor
-      return { ...pin, iconSize }
-    })
-  }, [thinned, zoom, mapLoaded, viewportTick, moveTick])
+  // The React-controlled GeoJSON source is built once per thinning change
+  // with placeholder iconSize=0/offset=[0,0]. After mount, an imperative rAF
+  // loop owns the source — it mutates the same FC and calls setData() each
+  // frame to push fresh sizes. React-map-gl only pushes through setData when
+  // the data prop reference changes (i.e. when `thinned` changes), so our
+  // imperative writes are never clobbered mid-gesture.
+  const fcRef = useRef<PinFC | null>(null)
+  const geojson = useMemo(() => {
+    const fc = buildFC(thinned)
+    fcRef.current = fc
+    return fc
+  }, [thinned])
 
-  const geojson = useMemo(
-    () => ({
-      type: 'FeatureCollection' as const,
-      features: pins.map(({ event: ev, count, iconSize }) => ({
-        type: 'Feature' as const,
-        geometry: { type: 'Point' as const, coordinates: [ev.lng, ev.lat] },
-        properties: { id: ev.id, iconId: iconIdFor(ev), count, iconSize },
-      })),
-    }),
-    [pins],
-  )
-
+  // Imperative rAF loop: computes per-pin iconSize + offsetY each frame during
+  // a gesture and mutates the FC, then pushes via setData. setData is the only
+  // way to update icon-size on a symbol layer (it's a layout property, so
+  // feature-state can't drive it). Calling setData directly from rAF avoids
+  // routing per-frame work through React's reconciliation, which was the
+  // original flicker source.
   useEffect(() => {
-    if (!mapLoaded) return
+    if (!mapLoaded || !iconsReady) return
     const map = mapRef.current?.getMap()
     if (!map) return
-    const bump = () => setViewportTick((t) => t + 1)
-    map.on('resize', bump)
-    return () => {
-      map.off('resize', bump)
+    if (thinned.length === 0) return
+    const fc = fcRef.current
+    if (!fc) return
+
+    let rafId = 0
+    const tick = () => {
+      writeSizes(map, thinned, fc)
+      rafId = requestAnimationFrame(tick)
     }
-  }, [mapLoaded])
+    const startLoop = () => {
+      if (rafId === 0) rafId = requestAnimationFrame(tick)
+    }
+    const stopLoop = () => {
+      if (rafId !== 0) {
+        cancelAnimationFrame(rafId)
+        rafId = 0
+      }
+      writeSizes(map, thinned, fc)
+    }
+    const onResize = () => writeSizes(map, thinned, fc)
+
+    writeSizes(map, thinned, fc)
+    map.on('movestart', startLoop)
+    map.on('moveend', stopLoop)
+    map.on('resize', onResize)
+    return () => {
+      if (rafId !== 0) cancelAnimationFrame(rafId)
+      map.off('movestart', startLoop)
+      map.off('moveend', stopLoop)
+      map.off('resize', onResize)
+    }
+  }, [mapLoaded, iconsReady, thinned])
 
   // Register an icon per event (not per visible pin) so re-thinning at higher
   // zoom finds the icon already in the sprite, with no mid-gesture pop-in.
@@ -238,31 +295,27 @@ export default function MapView() {
         mapStyle="mapbox://styles/mapbox/streets-v12"
         interactiveLayerIds={[EVENTS_LAYER_ID]}
         onLoad={() => setMapLoaded(true)}
-        onMove={(e) => {
+        onMoveEnd={(e) => {
           setZoom(e.viewState.zoom)
-          setMoveTick((t) => t + 1)
+          setSettledZoom(e.viewState.zoom)
         }}
-        onMoveEnd={(e) => setSettledZoom(e.viewState.zoom)}
         onClick={handleClick}
         onMouseEnter={() => setCursor('pointer')}
         onMouseLeave={() => setCursor('')}
       >
         {iconsReady && (
-          <Source id="events" type="geojson" data={geojson}>
+          <Source id={EVENTS_SOURCE_ID} type="geojson" data={geojson}>
             <Layer
               id={EVENTS_LAYER_ID}
               type="symbol"
               layout={{
                 'icon-image': ['get', 'iconId'],
-                // Per-pin iconSize is recomputed in source data on every
-                // move frame (see useMemo on `pins` keyed to `zoom`), so a
-                // plain data expression already animates smoothly with the
-                // gesture. A zoom expression here would actually be worse —
-                // symbol layers cache the layout-time evaluation of
-                // data-driven sizes and only update on source data change,
-                // so a ['zoom']-driven scale factor wouldn't re-evaluate
-                // per frame anyway.
+                // iconSize and offset are mutated per frame in fcRef.current's
+                // feature properties and pushed via source.setData() from the
+                // rAF loop. icon-size is a layout property and can't read
+                // feature-state, so plain ['get', ...] is required here.
                 'icon-size': ['get', 'iconSize'],
+                'icon-offset': ['get', 'offset'],
                 'icon-anchor': 'bottom',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,
@@ -308,7 +361,7 @@ export default function MapView() {
         loading={loading}
         error={error}
         count={events.length}
-        shown={pins.length}
+        shown={thinned.length}
         zoom={zoom}
       />
 

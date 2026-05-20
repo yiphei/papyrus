@@ -71,49 +71,6 @@ export interface ThinnedPin {
   count: number
 }
 
-export interface SizedPin extends ThinnedPin {
-  // Multiplier for the symbol layer's icon-size: scaled so each pin's icon
-  // expands to fill the gap to its nearest neighbor without overlapping it.
-  iconSize: number
-}
-
-// Set icon-size per pin so each icon grows to fill the gap to its nearest
-// neighbor in pixel space — sparse pins get magnified, dense pins stay small.
-// Approximates each icon as a circle of radius (iconNativePx/2)*iconSize at
-// the pin point; two same-sized neighbors at distance D touch when iconSize
-// = D/iconNativePx, so that's the cap. A lone pin (no neighbors) takes
-// maxSize. minSize keeps icons readable in worst-case clusters at the cost
-// of slight overlap when neighbors land below the floor distance.
-export function sizeByNearestNeighbor(
-  thinned: readonly ThinnedPin[],
-  zoom: number,
-  opts: { iconNativePx?: number; minSize?: number; maxSize?: number } = {},
-): SizedPin[] {
-  const iconNativePx = opts.iconNativePx ?? 110
-  const minSize = opts.minSize ?? MIN_PIXEL_SEPARATION / 110
-  // Sized so a lone pin's 110-px footprint × maxSize comfortably exceeds a
-  // typical viewport — the nearest-neighbor formula caps spread-out pins
-  // organically, so this only kicks in for truly isolated ones.
-  const maxSize = opts.maxSize ?? 15
-  const positions = thinned.map(({ event }) => lngLatToPx(event.lng, event.lat, zoom))
-  return thinned.map((pin, i) => {
-    let nearestDsq = Number.POSITIVE_INFINITY
-    const [x, y] = positions[i]
-    for (let j = 0; j < positions.length; j++) {
-      if (j === i) continue
-      const dx = x - positions[j][0]
-      const dy = y - positions[j][1]
-      const dsq = dx * dx + dy * dy
-      if (dsq < nearestDsq) nearestDsq = dsq
-    }
-    const raw = nearestDsq === Number.POSITIVE_INFINITY
-      ? maxSize
-      : Math.sqrt(nearestDsq) / iconNativePx
-    const iconSize = Math.min(maxSize, Math.max(minSize, raw))
-    return { ...pin, iconSize }
-  })
-}
-
 // Greedy O(N²) Poisson-disk filter. N ≤ ~200 so a quadtree is unnecessary.
 export function thinByPixelSeparation(
   ranked: readonly LiveEvent[],
